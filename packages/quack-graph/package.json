@@ -1,0 +1,32 @@
+{
+  "name": "quack-graph",
+  "version": "0.1.0",
+  "main": "src/index.ts",
+  "module": "dist/quack-graph.esm.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/quack-graph.esm.js",
+      "require": "./dist/quack-graph.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "build:watch": "tsup --watch",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "duckdb-async": "^1.0.0",
+    "apache-arrow": "^17.0.0",
+    "@quackgraph/native": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  }
+}

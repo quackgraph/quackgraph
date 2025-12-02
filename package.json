@@ -1,0 +1,32 @@
+{
+  "name": "quackgraph",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "format": "biome format --write . && cargo fmt",
+    "clean": "rm -rf node_modules target packages/*/node_modules packages/*/dist packages/native/*.node",
+    "postinstall": "bun run --cwd packages/native build",
+    "typecheck": "tsc --noEmit && cargo check --workspace",
+    "lint": "biome lint . && cargo clippy --workspace -- -D warnings",
+    "check": "biome check . && bun run typecheck",
+    "dev": "bun test --watch",
+    "test": "bun run build && bun test && cargo test --workspace",
+    "build": "bun run --cwd packages/native build && tsup",
+    "build:native": "bun run --cwd packages/native build",
+    "build:ts": "tsup",
+    "build:watch": "tsup --watch"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "latest",
+    "@types/bun": "latest",
+    "tsup": "^8.5.1",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

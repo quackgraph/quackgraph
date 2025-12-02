@@ -1,0 +1,19 @@
+[package]
+edition = "2021"
+name = "quack_native"
+version = "0.0.1"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Napi dependencies for bridging
+napi = { version = "2.12.2", default-features = false, features = ["napi4"] }
+napi-derive = "2.12.2"
+
+# Our Core Logic
+quack_core = { path = "../../crates/quack_core" }
+arrow = { version = "53.0.0" }
+
+[build-dependencies]
+napi-build = "2.0.1"

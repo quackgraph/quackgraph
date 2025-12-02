@@ -1,0 +1,11 @@
+[package]
+name = "quack_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+bitvec = { version = "1.0", features = ["serde"] }
+arrow = { version = "53.0.0" }
+bincode = "1.3"
