@@ -128,10 +128,10 @@ export class QueryBuilder {
     const prefix = tableAlias ? `${tableAlias}.` : '';
     if (this.graph.context.asOf) {
       // Time Travel: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
-      // Interpolate strict ISO string
-      const iso = this.graph.context.asOf.toISOString();
-      // DuckDB TIMESTAMP comparison works with ISO strings
-      return `(${prefix}valid_from <= '${iso}' AND (${prefix}valid_to > '${iso}' OR ${prefix}valid_to IS NULL))`;
+      // Use microseconds since epoch for consistency with native layer
+      const micros = this.graph.context.asOf.getTime() * 1000;
+      // Convert database timestamps to microseconds for comparison
+      return `(date_diff('us', '1970-01-01'::TIMESTAMPTZ, ${prefix}valid_from) <= ${micros} AND (date_diff('us', '1970-01-01'::TIMESTAMPTZ, ${prefix}valid_to) > ${micros} OR ${prefix}valid_to IS NULL))`;
     }
     // Default: Current valid records (valid_to is NULL)
     return `${prefix}valid_to IS NULL`;
@@ -208,7 +208,7 @@ export class QueryBuilder {
     // For V1, we accept that traversal is instant/current, but properties are historical.
 
     for (const step of this.traversals) {
-      const asOfTs = this.graph.context.asOf ? this.graph.context.asOf.getTime() : undefined;
+      const asOfTs = this.graph.context.asOf ? this.graph.context.asOf.getTime() * 1000 : undefined;
 
       if (currentIds.length === 0) break;
       

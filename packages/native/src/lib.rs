@@ -81,8 +81,8 @@ impl NativeGraph {
             Some("in") | Some("IN") => Direction::Incoming,
             _ => Direction::Outgoing,
         };
-        // Convert JS millis -> Rust micros
-        let ts = as_of.map(|t| (t * 1000.0) as i64);
+        // JavaScript now passes microseconds directly
+        let ts = as_of.map(|t| t as i64);
         self.inner.traverse(&sources, edge_type.as_deref(), dir, ts)
     }
 
@@ -97,7 +97,7 @@ impl NativeGraph {
         
         let min = min_depth.unwrap_or(1) as usize;
         let max = max_depth.unwrap_or(1) as usize;
-        let ts = as_of.map(|t| (t * 1000.0) as i64);
+        let ts = as_of.map(|t| t as i64);
         
         self.inner.traverse_recursive(&sources, edge_type.as_deref(), dir, min, max, ts)
     }
@@ -131,7 +131,7 @@ impl NativeGraph {
             return Vec::new();
         }
 
-        let ts = as_of.map(|t| (t * 1000.0) as i64);
+        let ts = as_of.map(|t| t as i64);
         let matcher = Matcher::new(&self.inner, &core_pattern);
         let raw_results = matcher.find_matches(&start_candidates, ts);
 

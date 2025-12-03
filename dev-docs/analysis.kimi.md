@@ -41,26 +41,7 @@ async addNode(id: string) {
 
 DONE
 
-**Fix**: Move cache update *after* successful DB commit. Better yet, invalidate cache and rebuild asynchronously on failure.
 
-### 2. **Temporal Inconsistency in Traversal**
-The Rust graph only holds **current** topology (`valid_to IS NULL`). The `asOf()` method only filters properties, not graph structure:
-```typescript
-.asOf(new Date('2024-01-01'))
-  .out('KNOWS') // Still uses current graph!
-```
-**Fix**: Document this limitation. V2 should version the graph index or check timestamps during traversal.
-
-### 3. **O(n²) Edge Insertion**
-```rust
-if !out_vec.contains(&(u_tgt, u_type)) { // O(n) scan!
-```
-**Fix**: Use temporary `HashSet` during bulk loads:
-```rust
-pub fn add_edge_bulk(&mut self, edges: Vec<(&str, &str, &str)>) {
-    // Use HashSet for O(1) dedup, then drain to Vec
-}
-```
 
 ### 4. **Vector Search Fallback is Broken**
 ```sql

@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     labels TEXT[],
     properties JSON,
     embedding DOUBLE[], -- Vector embedding
-    valid_from TIMESTAMPTZ DEFAULT current_timestamp,
+    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
     valid_to TIMESTAMPTZ DEFAULT NULL
 );
 CREATE SEQUENCE IF NOT EXISTS seq_node_id;
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS edges (
     target TEXT NOT NULL,
     type TEXT NOT NULL,
     properties JSON,
-    valid_from TIMESTAMPTZ DEFAULT current_timestamp,
+    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
     valid_to TIMESTAMPTZ DEFAULT NULL
 );
 `;
@@ -37,13 +37,13 @@ export class SchemaManager {
     await this.db.transaction(async (tx: DbExecutor) => {
       // 1. Close existing record (SCD Type 2)
       await tx.execute(
-        `UPDATE nodes SET valid_to = current_timestamp WHERE id = ? AND valid_to IS NULL`,
+        `UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`,
         [id]
       );
       // 2. Insert new version
       await tx.execute(`
         INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
-        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, current_timestamp, NULL)
+        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, (current_timestamp AT TIME ZONE 'UTC'), NULL)
       `, [id, JSON.stringify(labels), JSON.stringify(properties)]);
     });
   }
@@ -53,13 +53,13 @@ export class SchemaManager {
     await this.db.transaction(async (tx: DbExecutor) => {
       // 1. Close existing edge
       await tx.execute(
-        `UPDATE edges SET valid_to = current_timestamp WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+        `UPDATE edges SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
         [source, target, type]
       );
       // 2. Insert new version
       await tx.execute(`
         INSERT INTO edges (source, target, type, properties, valid_from, valid_to) 
-        VALUES (?, ?, ?, ?::JSON, current_timestamp, NULL)
+        VALUES (?, ?, ?, ?::JSON, (current_timestamp AT TIME ZONE 'UTC'), NULL)
       `, [source, target, type, JSON.stringify(properties)]);
     });
   }
@@ -68,7 +68,7 @@ export class SchemaManager {
     // Soft Delete: Close the validity period
     await this.db.transaction(async (tx: DbExecutor) => {
       await tx.execute(
-        `UPDATE nodes SET valid_to = current_timestamp WHERE id = ? AND valid_to IS NULL`,
+        `UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`,
         [id]
       );
     });
@@ -78,7 +78,7 @@ export class SchemaManager {
     // Soft Delete: Close the validity period
     await this.db.transaction(async (tx: DbExecutor) => {
       await tx.execute(
-        `UPDATE edges SET valid_to = current_timestamp WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+        `UPDATE edges SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
         [source, target, type]
       );
     });
@@ -160,7 +160,7 @@ export class SchemaManager {
         finalLabels = row.labels; // Preserve existing labels
 
         // Close old version
-        await tx.execute(`UPDATE nodes SET valid_to = current_timestamp WHERE id = ? AND valid_to IS NULL`, [id]);
+        await tx.execute(`UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`, [id]);
       } else {
         // Insert New
         id = matchProps.id || crypto.randomUUID();
@@ -171,7 +171,7 @@ export class SchemaManager {
       // Insert new version (for both Update and Create cases)
       await tx.execute(`
         INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
-        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, current_timestamp, NULL)
+        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, (current_timestamp AT TIME ZONE 'UTC'), NULL)
       `, [id, JSON.stringify(finalLabels), JSON.stringify(finalProps)]);
 
       return id;
