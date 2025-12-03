@@ -20,7 +20,7 @@ describe('E2E: Knowledge Graph RAG (Vector + Graph)', () => {
     if (!g.capabilities.vss) {
        try {
          // Verify array_distance availability before claiming VSS support
-         await g.db.query("SELECT array_distance([1,2]::DOUBLE[], [3,4]::DOUBLE[])");
+         await g.db.query("SELECT array_distance([1,2]::DOUBLE[2], [3,4]::DOUBLE[2])");
          g.capabilities.vss = true;
        } catch (_e) {
          console.warn("Skipping RAG test: array_distance not supported in this DuckDB build.");
@@ -41,8 +41,8 @@ describe('E2E: Knowledge Graph RAG (Vector + Graph)', () => {
     await g.addNode('doc:B', ['Document'], { title: 'Sky' });
     
     // Backfill embeddings manually (since addNode helper doesn't expose float[] column)
-    await g.db.execute("UPDATE nodes SET embedding = ?::DOUBLE[] WHERE id = 'doc:A'", [`[${vecA.join(',')}]`]);
-    await g.db.execute("UPDATE nodes SET embedding = ?::DOUBLE[] WHERE id = 'doc:B'", [`[${vecB.join(',')}]`]);
+    await g.db.execute("UPDATE nodes SET embedding = ?::DOUBLE[3] WHERE id = 'doc:A'", [`[${vecA.join(',')}]`]);
+    await g.db.execute("UPDATE nodes SET embedding = ?::DOUBLE[3] WHERE id = 'doc:B'", [`[${vecB.join(',')}]`]);
 
     await g.addNode('u:alice', ['User'], { name: 'Alice' });
     await g.addNode('u:bob', ['User'], { name: 'Bob' });

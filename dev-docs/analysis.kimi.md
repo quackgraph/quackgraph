@@ -90,7 +90,7 @@ if (!ALLOWED_TYPES.includes(type.toUpperCase())) throw ...;
 | Full table scans | `SchemaManager` | High | Add indexes (see above) |
 | Unnecessary clones | `Interner::intern()` | Low | `key.clone()` is fine; no issue |
 
---- DOING
+--- DONE
 
 ## 🎯 API Design Issues
 

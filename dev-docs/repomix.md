@@ -1274,73 +1274,6 @@ describe('E2E: Infrastructure Routing (Redundancy)', () => {
 });
 ````
 
-## File: test/e2e/knowledge-graph-rag.test.ts
-````typescript
-import { describe, test, expect, afterEach } from 'bun:test';
-import { createGraph, cleanupGraph } from '../utils/helpers';
-import type { QuackGraph } from '../../packages/quack-graph/src/index';
-
-describe('E2E: Knowledge Graph RAG (Vector + Graph)', () => {
-  let g: QuackGraph;
-  let path: string;
-
-  afterEach(async () => {
-    if (path) await cleanupGraph(path);
-  });
-
-  test('should combine vector search with graph traversal', async () => {
-    const setup = await createGraph('disk', 'e2e-rag');
-    g = setup.graph;
-    path = setup.path;
-
-    // Hack: Manually enable VSS capability if the extension failed to load but array_distance exists (Native DuckDB)
-    // This ensures tests pass on environments without the VSS binary extension
-    if (!g.capabilities.vss) {
-       try {
-         // Verify array_distance availability before claiming VSS support
-         await g.db.query("SELECT array_distance([1,2]::DOUBLE[], [3,4]::DOUBLE[])");
-         g.capabilities.vss = true;
-       } catch (_e) {
-         console.warn("Skipping RAG test: array_distance not supported in this DuckDB build.");
-         return;
-       }
-    }
-
-    // 1. Setup Data
-    // Query Vector: [1, 0, 0]
-    // Doc A: [0.9, 0.1, 0] (Close) -> WrittenBy Alice
-    // Doc B: [0, 1, 0]     (Far)   -> WrittenBy Bob
-
-    const vecQuery = [1, 0, 0];
-    const vecA = [0.9, 0.1, 0];
-    const vecB = [0, 1, 0];
-
-    await g.addNode('doc:A', ['Document'], { title: 'Apples' });
-    await g.addNode('doc:B', ['Document'], { title: 'Sky' });
-    
-    // Backfill embeddings manually (since addNode helper doesn't expose float[] column)
-    await g.db.execute("UPDATE nodes SET embedding = ?::DOUBLE[] WHERE id = 'doc:A'", [`[${vecA.join(',')}]`]);
-    await g.db.execute("UPDATE nodes SET embedding = ?::DOUBLE[] WHERE id = 'doc:B'", [`[${vecB.join(',')}]`]);
-
-    await g.addNode('u:alice', ['User'], { name: 'Alice' });
-    await g.addNode('u:bob', ['User'], { name: 'Bob' });
-
-    await g.addEdge('doc:A', 'u:alice', 'WRITTEN_BY');
-    await g.addEdge('doc:B', 'u:bob', 'WRITTEN_BY');
-
-    // 2. Query: Find 1 document nearest to query vector, then find its author
-    const results = await g.match(['Document'])
-        .nearText(vecQuery, { limit: 1 }) // Should select doc:A
-        .out('WRITTEN_BY')                // -> Alice
-        .node(['User'])
-        .select(u => u.name);
-
-    expect(results.length).toBe(1);
-    expect(results[0]).toBe('Alice');
-  });
-});
-````
-
 ## File: test/e2e/recommendation.test.ts
 ````typescript
 import { describe, test, expect, afterEach } from 'bun:test';
@@ -1627,123 +1560,6 @@ describe('E2E: Supply Chain Impact Analysis', () => {
 });
 ````
 
-## File: test/e2e/v2-features.test.ts
-````typescript
-import { describe, test, expect, afterEach } from 'bun:test';
-import { createGraph, cleanupGraph } from '../utils/helpers';
-import type { QuackGraph } from '../../packages/quack-graph/src/index';
-
-describe('E2E: V2 Features (Recursion & Merge)', () => {
-  let g: QuackGraph;
-  let path: string;
-
-  afterEach(async () => {
-    if (path) await cleanupGraph(path);
-  });
-
-  test('should traverse variable length paths (recursion)', async () => {
-    const setup = await createGraph('disk', 'e2e-recursion');
-    g = setup.graph;
-    path = setup.path;
-
-    // Chain: A -> B -> C -> D -> E
-    await g.addNode('A', ['Node']);
-    await g.addNode('B', ['Node']);
-    await g.addNode('C', ['Node']);
-    await g.addNode('D', ['Node']);
-    await g.addNode('E', ['Node']);
-
-    await g.addEdge('A', 'B', 'NEXT');
-    await g.addEdge('B', 'C', 'NEXT');
-    await g.addEdge('C', 'D', 'NEXT');
-    await g.addEdge('D', 'E', 'NEXT');
-
-    // Query 1: 1..2 hops from A
-    // Should find B (1 hop) and C (2 hops)
-    const result1 = await g.match(['Node'])
-      .where({ id: 'A' })
-      .recursive('NEXT', { min: 1, max: 2 })
-      .select(n => n.id);
-    
-    expect(result1.sort()).toEqual(['B', 'C']);
-
-    // Query 2: 2..4 hops from A
-    // Should find C (2), D (3), E (4)
-    const result2 = await g.match(['Node'])
-      .where({ id: 'A' })
-      .recursive('NEXT', { min: 2, max: 4 })
-      .select(n => n.id);
-    
-    expect(result2.sort()).toEqual(['C', 'D', 'E']);
-
-    // Query 3: Max depth exceeding chain
-    const result3 = await g.match(['Node'])
-      .where({ id: 'A' })
-      .recursive('NEXT', { min: 1, max: 10 })
-      .select(n => n.id);
-    
-    expect(result3.sort()).toEqual(['B', 'C', 'D', 'E']);
-  });
-
-  test('should handle cycles in recursive traversal gracefully', async () => {
-    const setup = await createGraph('disk', 'e2e-recursion-cycle');
-    g = setup.graph;
-    path = setup.path;
-
-    // Cycle: A -> B -> A
-    await g.addNode('A', ['Node']);
-    await g.addNode('B', ['Node']);
-    await g.addEdge('A', 'B', 'LOOP');
-    await g.addEdge('B', 'A', 'LOOP');
-
-    // Recursive traverse
-    // Rust implementation marks start node as visited, so it shouldn't be returned unless it's encountered again via a longer path (but BFS with visited set prevents re-visiting).
-    const res = await g.match(['Node'])
-      .where({ id: 'A' })
-      .recursive('LOOP', { min: 1, max: 5 })
-      .select(n => n.id);
-      
-    // A -> B (visited=A,B) -> A (skip)
-    expect(res).toEqual(['B']);
-  });
-
-  test('should handle merge (upsert) idempotently', async () => {
-    const setup = await createGraph('disk', 'e2e-merge');
-    g = setup.graph;
-    path = setup.path;
-
-    // 1. First Merge (Create)
-    // Matches if label='User' AND email='test@example.com'
-    const id1 = await g.mergeNode('User', { email: 'test@example.com' }, { name: 'Test User', loginCount: 1 });
-    
-    // Check in-memory index
-    const count1 = g.native.nodeCount;
-    expect(count1).toBe(1);
-    
-    // Check DB
-    const node1 = await g.match(['User']).where({ email: 'test@example.com' }).select();
-    expect(node1[0].name).toBe('Test User');
-    expect(node1[0].loginCount).toBe(1);
-
-    // 2. Second Merge (Update)
-    // Matches by email, updates loginCount
-    const id2 = await g.mergeNode('User', { email: 'test@example.com' }, { loginCount: 2 });
-    
-    // ID should be same
-    expect(id2).toBe(id1);
-    
-    // Count should remain 1
-    const count2 = g.native.nodeCount;
-    expect(count2).toBe(1); 
-
-    // Properties should be merged
-    const node2 = await g.match(['User']).where({ email: 'test@example.com' }).select();
-    expect(node2[0].loginCount).toBe(2);
-    expect(node2[0].name).toBe('Test User'); // Should persist
-  });
-});
-````
-
 ## File: test/integration/complex-query.test.ts
 ````typescript
 import { describe, test, expect, afterEach } from 'bun:test';
@@ -1901,90 +1717,6 @@ describe('Integration: Concurrency', () => {
     // Note: If we didn't compact, this might be 3 depending on implementation, but compact enforces uniqueness.
     expect(g.native.edgeCount).toBe(1);
     expect(g.native.traverse(['src'], 'KNOWS', 'out')).toEqual(['tgt']);
-  });
-});
-````
-
-## File: test/integration/errors.test.ts
-````typescript
-import { describe, test, expect, afterEach } from 'bun:test';
-import { createGraph, cleanupGraph } from '../utils/helpers';
-import type { QuackGraph } from '../../packages/quack-graph/src/index';
-
-describe('Integration: Error Handling & Edge Cases', () => {
-  let g: QuackGraph;
-  let path: string;
-
-  afterEach(async () => {
-    if (path) await cleanupGraph(path);
-  });
-
-  test('should allow edges to non-existent nodes (Graph Pattern Matching behavior)', async () => {
-    // QuackGraph V1 is schemaless. It allows adding edges to nodes that haven't been explicitly created.
-    // However, since those nodes don't exist in the 'nodes' table, they should be filtered out 
-    // during the final hydration (SELECT * FROM nodes) step of the query builder.
-    
-    const setup = await createGraph('disk', 'int-errors');
-    g = setup.graph;
-    path = setup.path;
-
-    await g.addNode('real_node', ['Node']);
-    // Edge to phantom node
-    await g.addEdge('real_node', 'phantom_node', 'LINK');
-
-    // 1. Native Traversal should find it (Topology exists)
-    const nativeNeighbors = g.native.traverse(['real_node'], 'LINK', 'out');
-    expect(nativeNeighbors).toContain('phantom_node');
-
-    // 2. Query Builder should NOT return it (Data missing)
-    const neighbors = await g.match(['Node'])
-        .where({ id: 'real_node' })
-        .out('LINK')
-        .select(n => n.id);
-
-    expect(neighbors.length).toBe(0); 
-  });
-
-  test('should handle special characters in IDs', async () => {
-    const setup = await createGraph('disk', 'int-special-chars');
-    g = setup.graph;
-    path = setup.path;
-
-    const crazyId = 'Node/With"Quotes\'And\\Backslashes 🦆';
-    await g.addNode(crazyId, ['Node']);
-    await g.addNode('b', ['Node']);
-    await g.addEdge(crazyId, 'b', 'LINK');
-
-    const result = await g.match(['Node'])
-        .where({ id: crazyId })
-        .out('LINK')
-        .select(n => n.id);
-        
-    expect(result).toEqual(['b']);
-    
-    // Reverse check
-    const reverse = await g.match(['Node'])
-        .where({ id: 'b' })
-        .in('LINK')
-        .select(n => n.id);
-    
-    expect(reverse).toEqual([crazyId]);
-  });
-
-  test('should throw error when nearText is used without VSS extension', async () => {
-    const setup = await createGraph('disk', 'error-vss');
-    g = setup.graph;
-    path = setup.path;
-
-    // Force disable VSS capability
-    g.capabilities.vss = false;
-
-    // Attempt vector search
-    const promise = g.match(['Node'])
-      .nearText([1, 2, 3])
-      .select();
-
-    await expect(promise).rejects.toThrow('Vector search requires the DuckDB "vss" extension');
   });
 });
 ````
@@ -2214,357 +1946,6 @@ resolver = "2"
     "typescript": "^5"
   }
 }
-````
-
-## File: README.md
-````markdown
-# QuackGraph 🦆🕸️
-
-[![npm version](https://img.shields.io/npm/v/quack-graph.svg?style=flat-square)](https://www.npmjs.com/package/quack-graph)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/your-repo/quack-graph/ci.yml?style=flat-square)](https://github.com/your-repo/quack-graph/actions)
-[![Runtime: Bun](https://img.shields.io/badge/Runtime-Bun%20%2F%20Node-black.svg?style=flat-square)](https://bun.sh)
-[![Engine: Rust](https://img.shields.io/badge/Accelerator-Rust%20(CSR)-orange.svg?style=flat-square)](https://www.rust-lang.org/)
-[![Storage: DuckDB](https://img.shields.io/badge/Storage-DuckDB-brightgreen.svg?style=flat-square)](https://duckdb.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
-
-> **The Embedded Graph Analytics Engine.**
->
-> **Postgres is for records. QuackGraph is for relationships.**
->
-> QuackGraph is a **serverless, infrastructure-less** graph index that runs alongside your app. It combines **DuckDB** (Columnar Storage) with a **Rust/Wasm CSR Index** (O(1) Traversal) via **Zero-Copy Apache Arrow**.
->
-> No Docker containers. No JVM. Just `npm install` and raw speed.
-
----
-
-## 📖 Table of Contents
-
-1.  [**Why QuackGraph? (The Pitch)**](#-why-quackgraph-the-pitch)
-2.  [**The Architecture: A "Split-Brain" Engine**](#-the-architecture-a-split-brain-engine)
-3.  [**Installation**](#-installation)
-4.  [**Quick Start (5 Minutes)**](#-quick-start-5-minutes)
-5.  [**Core Concepts**](#-core-concepts)
-    *   [Schemaless & Gradual Typing](#1-schemaless--gradual-typing)
-    *   [GraphRAG (Vector Search)](#2-graphrag-vector-search)
-    *   [Temporal Time-Travel](#3-temporal-time-travel)
-    *   [Complex Patterns & Recursion](#4-complex-patterns--recursion)
-    *   [Declarative Mutations](#5-declarative-mutations)
-6.  [**Advanced Usage & Performance Tuning**](#-advanced-usage--performance-tuning)
-    *   [Property Promotion](#property-promotion-json--native)
-    *   [Topology Snapshots](#topology-snapshots-for-instant-boot)
-    *   [Server-Side Aggregations](#server-side-aggregations)
-    *   [Cypher Compatibility](#cypher-compatibility)
-7.  [**Runtime Targets: Native vs. Edge**](#-runtime-targets-native-vs-edge)
-8.  [**Comparison with Alternatives**](#-comparison-with-alternatives)
-9.  [**Known Limits & Trade-offs**](#-known-limits--trade-offs)
-10. [**Contributing**](#-contributing)
-11. [**Roadmap**](#-roadmap)
-
----
-
-## 💡 Why QuackGraph?
-
-**The "SQLite for Graphs" Moment.**
-
-Enterprises run Neo4j Clusters. Startups and Local-First apps don't have that luxury. You shouldn't need to deploy a heavy Java-based server just to query "friends of friends" or build a RAG pipeline.
-
-QuackGraph is **CQRS in a box**:
-1.  **Ingest:** Data lands in **DuckDB**. It's cheap, ACID-compliant, and handles millions of rows on a laptop.
-2.  **Index:** We project the topology into a **Rust Compressed Sparse Row (CSR)** structure in RAM.
-3.  **Query:** Graph traversals happen in nanoseconds (memory pointers), while heavy aggregations happen in DuckDB (vectorized SQL).
-
-**Use Cases:**
-*   **GraphRAG:** Combine Vector Search (HNSW) with Knowledge Graph traversal in a single process.
-*   **Fraud Detection:** Detect cycles and rings in transaction logs without network latency.
-*   **Local-First SaaS:** Ship complex analytics in Electron apps or Edge workers.
-
----
-
-## 📐 Architecture: Zero-Copy Hybrid Engine
-
-QuackGraph is not a database replacement; it is a **Read-Optimized View**. It leverages **Apache Arrow** to stream data from Disk to RAM at ~1GB/s.
-
-```ascii
-[ Your App (Bun / Node / Wasm) ]
-     │
-     ▼
-[ QuackGraph DX Layer (TypeScript) ]
-     │
-     ├── Writes ───────────────┐
-     │                         ▼
-     │                 [ DuckDB Storage ] (Persistent Source of Truth)
-     │                 (Parquet / JSON / WAL)
-     │                         │
-     ├── Reads (Filters) ◄─────┤
-     │                         │
-     │                 (Arrow IPC Stream for Hydration)
-     │                         ▼
-     └── Reads (Hops) ◄── [ Rust Index ] (Transient In-Memory Cache)
-                          (CSR Topology)
-```
-
-1.  **DuckDB is King:** All writes (`addNode`, `addEdge`) go immediately and atomically to DuckDB.
-2.  **Rust is a View:** The In-Memory Graph Index is a *read-optimized, transient view* of the data on disk.
-3.  **Hydration:** On startup, we stream edges from DuckDB to Rust via Arrow IPC (~1M edges/sec).
-4.  **Consistency:** If the process crashes, the RAM index is gone. No data loss occurs because the data is safely in `.duckdb`.
-
----
-
-## 📦 Installation
-
-Choose your runtime target.
-
-### 🏎️ Native (Backend / CLI)
-*Best for: Bun, Node.js, Electron, Tauri.*
-Uses `napi-rs` for native C++ performance.
-
-```bash
-bun add quack-graph
-```
-
-### 🌍 Edge (Serverless / Browser)
-*Best for: Cloudflare Workers, Vercel Edge, Local-First Web Apps.*
-Uses WebAssembly.
-
-```bash
-bun add quack-graph @duckdb/duckdb-wasm apache-arrow
-```
-
----
-
-## ⚡ The API: Graph Topology meets SQL Analytics
-
-Stop writing 50-line `WITH RECURSIVE` SQL queries.
-QuackGraph gives you a Fluent TypeScript API for the topology, but lets you drop into raw SQL for the heavy lifting.
-
-**The "Hybrid" Query Pattern:**
-1.  **Graph Layer:** Use Rust to traverse hops instantly.
-2.  **SQL Layer:** Use DuckDB to aggregate the results.
-
-```typescript
-import { QuackGraph } from 'quack-graph';
-const g = new QuackGraph('./supply-chain.duckdb');
-
-// Scenario: "Find all downstream products affected by a bad Lithium batch,
-// and calculate the total inventory value at risk."
-
-const results = await g
-  // 1. Start: DuckDB Index Scan
-  .match(['Material'])
-  .where({ batch: 'BAD-BATCH-001' })
-
-  // 2. Traversal: Rust In-Memory CSR (Nanoseconds)
-  // Find everything this material flows into, up to 10 hops deep
-  .recursive('PART_OF', { min: 1, max: 10 })
-
-  // 3. Filter: Apply logic to the found nodes
-  .node(['Product'])
-  .where({ status: 'active' })
-
-  // 4. Analytics: Push aggregation down to DuckDB (Zero Data Transfer)
-  // We can write raw SQL inside .select()!
-  .select(`
-    id,
-    properties->>'name' as product_name,
-    (properties->>'price')::FLOAT * (properties->>'stock')::INT as value_at_risk
-  `);
-
-console.table(results);
-/*
-┌────────────┬──────────────┬───────────────┐
-│ id         │ product_name │ value_at_risk │
-├────────────┼──────────────┼───────────────┤
-│ prod:ev_1  │ Tesla Model3 │ 1500000       │
-│ prod:bat_x │ PowerWall    │ 45000         │
-└────────────┴──────────────┴───────────────┘
-*/
-```
-
----
-
-## 🧠 Core Concepts
-
-### 1. Schemaless & Gradual Typing
-Start with `any`. Harden with `Zod`. QuackGraph stores properties as a `JSON` column in DuckDB, allowing instant iteration. When you need safety, bind a Schema.
-
-```typescript
-import { z } from 'zod';
-const UserSchema = z.object({ name: z.string(), role: z.enum(['Admin', 'User']) });
-
-const g = new QuackGraph('db.duckdb').withSchemas({ User: UserSchema });
-// TypeScript now provides strict autocomplete and runtime validation
-```
-
-### 2. GraphRAG (Vector Search)
-Build **Local-First AI** apps. QuackGraph bundles `duckdb_vss` (HNSW Indexing). Your graph *is* your vector store.
-
-```typescript
-// Find documents similar to [Query], then find who wrote them
-const authors = await g
-  .nearText(['Document'], queryVector, { limit: 10 }) // HNSW Search
-  .in('AUTHORED_BY')                                  // Graph Hop
-  .node(['User'])
-  .select(u => u.name);
-```
-
-### 3. Temporal Time-Travel
-The database is **Append-Only**. We never overwrite data; we version it. This gives you Git-like history for your data.
-
-```typescript
-// Oops, someone deleted the edges? Query the graph as it existed 10 minutes ago.
-const snapshot = g.asOf(new Date(Date.now() - 10 * 60 * 1000));
-const count = await snapshot.match(['User']).count();
-```
-
-### 4. Complex Patterns & Recursion
-Match Neo4j's expressiveness with fluent ergonomics.
-
-**Variable-Length Paths (Recursive):**
-```typescript
-// Find friends of friends (1 to 5 hops away)
-const network = await g.match(['User'])
-  .where({ id: 'Alice' })
-  .recursive('KNOWS', { min: 1, max: 5 })
-  .select(u => u.name);
-```
-
-**Pattern Matching (Isomorphism):**
-```typescript
-// Find a "Triangle" (A knows B, B knows C, C knows A)
-const triangles = await g.match(['User']).as('a')
-  .out('KNOWS').as('b')
-  .out('KNOWS').as('c')
-  .matchEdge('c', 'a', 'KNOWS') // Close the loop
-  .return(row => ({
-    a: row.a.name,
-    b: row.b.name,
-    c: row.c.name
-  }));
-```
-
-### 5. Declarative Mutations (Upserts)
-Don't write race-condition-prone check-then-insert code. We provide atomic `MERGE` semantics equivalent to Neo4j.
-
-```typescript
-// Idempotent Ingestion
-const userId = await g.mergeNode('User', { email: 'alice@corp.com' })
-  .match({ email: 'alice@corp.com' })   // Look up by unique key
-  .set({ last_seen: new Date() })       // Update if exists
-  .run();
-```
-
----
-
-## 🛠️ Advanced Usage & Performance Tuning
-
-### Property Promotion (JSON -> Native)
-Filtering inside large JSON blobs is slower than native columns. QuackGraph can materialize hot fields for you.
-
-```typescript
-// Background migration: pulls 'age' out of the JSON blob into a native INTEGER column for 50x faster reads.
-await g.optimize.promoteProperty('User', 'age', 'INTEGER');
-```
-
-### Topology Snapshots (for Instant Boot)
-The "Hydration" phase can be slow for huge graphs. You can snapshot the in-memory Rust index to disk.
-
-```typescript
-// Save the RAM index to disk
-await g.optimize.saveTopologySnapshot('./topology.snapshot');
-
-// On next boot, load the snapshot instead of re-reading from DuckDB
-const g = new QuackGraph('./data.duckdb', { topologySnapshot: './topology.snapshot' });
-```
-
-### Server-Side Aggregations
-Don't pull data back to JS just to count it. Push the math to DuckDB.
-
-```typescript
-// "MATCH (u:User) RETURN u.city, count(u) as pop"
-const stats = await g.match(['User'])
-  .groupBy(u => u.city)
-  .count()
-  .as('pop')
-  .run();
-```
-
-### Cypher Compatibility
-For easy migration and interoperability, you can run raw Cypher queries.
-
-```typescript
-// (Roadmap v1.0)
-const results = await g.query(`
-  MATCH (u:User {name: 'Alice'})-[:MENTORS]->(mentee:User)
-  WHERE mentee.age < 30
-  RETURN mentee.name
-`);```
-
----
-
-## 🎯 Runtime Targets: Native vs. Edge
-
-| Feature | **Native (Bun/Node)** | **Edge (Wasm)** |
-| :--- | :--- | :--- |
-| **Engine** | Rust (Napi-rs) | Rust (Wasm) |
-| **Performance** | 🚀 **Highest** | 🐇 Fast |
-| **Cold Start** | ~50ms | ~400ms (Wasm boot) |
-| **Max Memory** | System RAM | ~128MB (CF Workers) |
-| **Best For** | Backends, CLI, Desktop | Serverless, Browser, Local-First |
-
----
-
-## 🆚 Comparison with Alternatives
-
-| Feature | QuackGraph 🦆 | Neo4j / TigerGraph | Raw SQL (Postgres/DuckDB) |
-| :--- | :--- | :--- | :--- |
-| **Deployment** | **`npm install`** | Docker / K8s Cluster | Docker / RDS |
-| **Architecture** | **Embedded Library** | Standalone Server | Database Engine |
-| **Latency** | **Nanoseconds (In-Proc)** | Milliseconds (Network) | Microseconds (IO) |
-| **Vector RAG**| **Native (HNSW)** | Plugin Required | Extension (pgvector) |
-| **Traversal** | **O(1) RAM Pointers** | O(1) RAM Pointers | O(log n) Index Joins |
-| **Cost** | **$0 / Compute Only** | $$ License / Cloud | $ Instance Cost |
-
----
-
-## ⚠️ Known Limits & Trade-offs
-
-1.  **Memory Wall (Edge):**
-    *   On Cloudflare Workers (128MB limit), the Graph Index can hold **~200k edges** before OOM.
-    *   *Workaround:* Use integer IDs (`1001` vs `"user_uuid_v4"`) to save ~60% RAM.
-2.  **Concurrency:**
-    *   DuckDB is **Single-Writer**. This is not for high-concurrency OLTP (e.g., a Banking Ledger).
-    *   It is designed for **Read-Heavy / Analytic** workloads (RAG, Recommendations, Dashboards).
-3.  **Deep Pattern Matching:**
-    *   While we support basic isomorphism (triangles, rings), extremely large subgraph queries (>10 node patterns) are computationally expensive in any engine. We optimize for "OLTP-style" pattern matching (small local patterns) rather than whole-graph analytics.
-
----
-
-## 🤝 Contributing
-
-We are building the standard library for Graph Data in TypeScript.
-This project is a Bun Workspace monorepo.
-
-1.  **Install:** `bun install`
-2.  **Build Native:** `cd packages/native && bun build`
-3.  **Run Tests:** `bun test`
-
-All contributions are welcome. Please open an issue to discuss your ideas.
-
----
-
-## 🗓️ Roadmap
-
-*   ✅ **v0.1:** Core Engine (Native + Wasm).
-*   🟡 **v0.5:** **Recursion & Patterns.** Rust-side VF2 solver and Recursive DFS.
-*   ⚪️ **v1.0:** **Auto-Columnarization.** Background job that detects hot JSON fields and promotes them to native DuckDB columns.
-*   ⚪️ **v1.1:** **Cypher Parser.** `g.query('MATCH (n)-[:KNOWS]->(m) RETURN m')` for easy migration.
-*   ⚪️ **v1.2:** **Replication.** `g.sync('s3://bucket/graph')` for multi-device sync.
-
----
-
-## 📄 License
-
-**MIT**
 ````
 
 ## File: RFC.README.md
@@ -3594,195 +2975,280 @@ mod tests {
 }
 ````
 
-## File: packages/quack-graph/src/schema.ts
+## File: test/e2e/knowledge-graph-rag.test.ts
 ````typescript
-import type { DuckDBManager, DbExecutor } from './db';
+import { describe, test, expect, afterEach } from 'bun:test';
+import { createGraph, cleanupGraph } from '../utils/helpers';
+import type { QuackGraph } from '../../packages/quack-graph/src/index';
 
-const NODES_TABLE = `
-CREATE TABLE IF NOT EXISTS nodes (
-    row_id UBIGINT PRIMARY KEY, -- Simple auto-increment equivalent logic handled by sequence
-    id TEXT NOT NULL,
-    labels TEXT[],
-    properties JSON,
-    embedding DOUBLE[], -- Vector embedding
-    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
-    valid_to TIMESTAMPTZ DEFAULT NULL
-);
-CREATE SEQUENCE IF NOT EXISTS seq_node_id;
-`;
+describe('E2E: Knowledge Graph RAG (Vector + Graph)', () => {
+  let g: QuackGraph;
+  let path: string;
 
-const EDGES_TABLE = `
-CREATE TABLE IF NOT EXISTS edges (
-    source TEXT NOT NULL,
-    target TEXT NOT NULL,
-    type TEXT NOT NULL,
-    properties JSON,
-    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
-    valid_to TIMESTAMPTZ DEFAULT NULL
-);
-`;
+  afterEach(async () => {
+    if (path) await cleanupGraph(path);
+  });
 
-export class SchemaManager {
-  constructor(private db: DuckDBManager) {}
+  test('should combine vector search with graph traversal', async () => {
+    const setup = await createGraph('disk', 'e2e-rag');
+    g = setup.graph;
+    path = setup.path;
 
-  async ensureSchema() {
-    await this.db.execute(NODES_TABLE);
-    await this.db.execute(EDGES_TABLE);
-
-    // Performance Indexes
-    // Note: Partial indexes (WHERE valid_to IS NULL) are not supported in all DuckDB environments/bindings yet.
-    // We use standard indexes for now.
-    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_nodes_id ON nodes (id)');
-    // idx_nodes_labels removed: Standard B-Tree on LIST column does not help list_contains() queries.
-    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_edges_src_tgt_type ON edges (source, target, type)');
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeNode(id: string, labels: string[], properties: Record<string, any> = {}) {
-    await this.db.transaction(async (tx: DbExecutor) => {
-      // 1. Close existing record (SCD Type 2)
-      await tx.execute(
-        `UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`,
-        [id]
-      );
-      // 2. Insert new version
-      await tx.execute(`
-        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
-        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, (current_timestamp AT TIME ZONE 'UTC'), NULL)
-      `, [id, JSON.stringify(labels), JSON.stringify(properties)]);
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}) {
-    await this.db.transaction(async (tx: DbExecutor) => {
-      // 1. Close existing edge
-      await tx.execute(
-        `UPDATE edges SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
-        [source, target, type]
-      );
-      // 2. Insert new version
-      await tx.execute(`
-        INSERT INTO edges (source, target, type, properties, valid_from, valid_to) 
-        VALUES (?, ?, ?, ?::JSON, (current_timestamp AT TIME ZONE 'UTC'), NULL)
-      `, [source, target, type, JSON.stringify(properties)]);
-    });
-  }
-
-  async deleteNode(id: string) {
-    // Soft Delete: Close the validity period
-    await this.db.transaction(async (tx: DbExecutor) => {
-      await tx.execute(
-        `UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`,
-        [id]
-      );
-    });
-  }
-
-  async deleteEdge(source: string, target: string, type: string) {
-    // Soft Delete: Close the validity period
-    await this.db.transaction(async (tx: DbExecutor) => {
-      await tx.execute(
-        `UPDATE edges SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
-        [source, target, type]
-      );
-    });
-  }
-
-  /**
-   * Promotes a JSON property to a native column for faster filtering.
-   * This creates a column on the `nodes` table and backfills it from the `properties` JSON blob.
-   * 
-   * @param label The node label to target (e.g., 'User'). Only nodes with this label will be updated.
-   * @param property The property key to promote (e.g., 'age').
-   * @param type The DuckDB SQL type (e.g., 'INTEGER', 'VARCHAR').
-   */
-  async promoteNodeProperty(label: string, property: string, type: string) {
-    // Sanitize inputs to prevent basic SQL injection (rudimentary check)
-    if (!/^[a-zA-Z0-9_]+$/.test(property)) throw new Error(`Invalid property name: '${property}'. Must be alphanumeric + underscore.`);
-    // Type check is looser to allow various SQL types, but strictly alphanumeric + spaces/parens usually safe enough for now
-    if (!/^[a-zA-Z0-9_() ]+$/.test(type)) throw new Error(`Invalid SQL type: '${type}'.`);
-    // Sanitize label just in case, though it is used as a parameter usually, here we might need dynamic check if we were using it in table names, but we use it in list_contains param.
-    
-    // 1. Add Column (Idempotent)
-    try {
-      // Note: DuckDB 0.9+ supports ADD COLUMN IF NOT EXISTS
-      await this.db.execute(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ${property} ${type}`);
-    } catch (_e) {
-      // Fallback or ignore if column exists
+    // Hack: Manually enable VSS capability if the extension failed to load but array_distance exists (Native DuckDB)
+    // This ensures tests pass on environments without the VSS binary extension
+    if (!g.capabilities.vss) {
+       try {
+         // Verify array_distance availability before claiming VSS support
+         await g.db.query("SELECT array_distance([1,2]::DOUBLE[ANY], [3,4]::DOUBLE[ANY])");
+         g.capabilities.vss = true;
+       } catch (_e) {
+         console.warn("Skipping RAG test: array_distance not supported in this DuckDB build.");
+         return;
+       }
     }
 
-    // 2. Backfill Data
-    // We use list_contains to only update relevant nodes
-    const sql = `
-      UPDATE nodes 
-      SET ${property} = CAST(json_extract(properties, '$.${property}') AS ${type})
-      WHERE list_contains(labels, ?)
-    `;
-    await this.db.execute(sql, [label]);
-  }
+    // 1. Setup Data
+    // Query Vector: [1, 0, 0]
+    // Doc A: [0.9, 0.1, 0] (Close) -> WrittenBy Alice
+    // Doc B: [0, 1, 0]     (Far)   -> WrittenBy Bob
 
-  /**
-   * Declarative Merge (Upsert).
-   * Finds a node by `matchProps` and `label`.
-   * If found: Updates properties with `setProps`.
-   * If not found: Creates new node with `matchProps` + `setProps`.
-   * Returns the node ID.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
-  async mergeNode(label: string, matchProps: Record<string, any>, setProps: Record<string, any>): Promise<string> {
-    // 1. Build Search Query
-    const matchKeys = Object.keys(matchProps);
-    const conditions = [`valid_to IS NULL`, `list_contains(labels, ?)`];
-    // biome-ignore lint/suspicious/noExplicitAny: Params array
-    const params: any[] = [label];
+    const vecQuery = [1, 0, 0];
+    const vecA = [0.9, 0.1, 0];
+    const vecB = [0, 1, 0];
+
+    await g.addNode('doc:A', ['Document'], { title: 'Apples' });
+    await g.addNode('doc:B', ['Document'], { title: 'Sky' });
     
-    for (const key of matchKeys) {
-      if (key === 'id') {
-        conditions.push(`id = ?`);
-        params.push(matchProps[key]);
-      } else {
-        conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
-        params.push(JSON.stringify(matchProps[key]));
-      }
-    }
+    // Backfill embeddings manually (since addNode helper doesn't expose float[] column)
+    await g.db.execute("UPDATE nodes SET embedding = ?::DOUBLE[ANY] WHERE id = 'doc:A'", [`[${vecA.join(',')}]`]);
+    await g.db.execute("UPDATE nodes SET embedding = ?::DOUBLE[ANY] WHERE id = 'doc:B'", [`[${vecB.join(',')}]`]);
 
-    const searchSql = `SELECT id, labels, properties FROM nodes WHERE ${conditions.join(' AND ')} LIMIT 1`;
+    await g.addNode('u:alice', ['User'], { name: 'Alice' });
+    await g.addNode('u:bob', ['User'], { name: 'Bob' });
 
-    return await this.db.transaction(async (tx) => {
-      const rows = await tx.query(searchSql, params);
-      let id: string;
-      // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
-      let finalProps: Record<string, any>;
-      let finalLabels: string[];
+    await g.addEdge('doc:A', 'u:alice', 'WRITTEN_BY');
+    await g.addEdge('doc:B', 'u:bob', 'WRITTEN_BY');
 
-      if (rows.length > 0) {
-        // Update Existing
-        const row = rows[0];
-        id = row.id;
-        const currentProps = typeof row.properties === 'string' ? JSON.parse(row.properties) : row.properties;
-        finalProps = { ...currentProps, ...setProps };
-        finalLabels = row.labels; // Preserve existing labels
+    // 2. Query: Find 1 document nearest to query vector, then find its author
+    const results = await g.match(['Document'])
+        .nearText(vecQuery, { limit: 1 }) // Should select doc:A
+        .out('WRITTEN_BY')                // -> Alice
+        .node(['User'])
+        .select(u => u.name);
 
-        // Close old version
-        await tx.execute(`UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`, [id]);
-      } else {
-        // Insert New
-        id = matchProps.id || crypto.randomUUID();
-        finalProps = { ...matchProps, ...setProps };
-        finalLabels = [label];
-      }
+    expect(results.length).toBe(1);
+    expect(results[0]).toBe('Alice');
+  });
+});
+````
 
-      // Insert new version (for both Update and Create cases)
-      await tx.execute(`
-        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
-        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, (current_timestamp AT TIME ZONE 'UTC'), NULL)
-      `, [id, JSON.stringify(finalLabels), JSON.stringify(finalProps)]);
+## File: test/e2e/v2-features.test.ts
+````typescript
+import { describe, test, expect, afterEach } from 'bun:test';
+import { createGraph, cleanupGraph } from '../utils/helpers';
+import type { QuackGraph } from '../../packages/quack-graph/src/index';
 
-      return id;
-    });
-  }
-}
+describe('E2E: V2 Features (Recursion & Merge)', () => {
+  let g: QuackGraph;
+  let path: string;
+
+  afterEach(async () => {
+    if (path) await cleanupGraph(path);
+  });
+
+  test('should traverse variable length paths (recursion)', async () => {
+    const setup = await createGraph('disk', 'e2e-recursion');
+    g = setup.graph;
+    path = setup.path;
+
+    // Chain: A -> B -> C -> D -> E
+    await g.addNode('A', ['Node']);
+    await g.addNode('B', ['Node']);
+    await g.addNode('C', ['Node']);
+    await g.addNode('D', ['Node']);
+    await g.addNode('E', ['Node']);
+
+    await g.addEdge('A', 'B', 'NEXT');
+    await g.addEdge('B', 'C', 'NEXT');
+    await g.addEdge('C', 'D', 'NEXT');
+    await g.addEdge('D', 'E', 'NEXT');
+
+    // Query 1: 1..2 hops from A
+    // Should find B (1 hop) and C (2 hops)
+    const result1 = await g.match(['Node'])
+      .where({ id: 'A' })
+      .out('NEXT').depth(1, 2)
+      .select(n => n.id);
+    
+    expect(result1.sort()).toEqual(['B', 'C']);
+
+    // Query 2: 2..4 hops from A
+    // Should find C (2), D (3), E (4)
+    const result2 = await g.match(['Node'])
+      .where({ id: 'A' })
+      .out('NEXT').depth(2, 4)
+      .select(n => n.id);
+    
+    expect(result2.sort()).toEqual(['C', 'D', 'E']);
+
+    // Query 3: Max depth exceeding chain
+    const result3 = await g.match(['Node'])
+      .where({ id: 'A' })
+      .out('NEXT').depth(1, 10)
+      .select(n => n.id);
+    
+    expect(result3.sort()).toEqual(['B', 'C', 'D', 'E']);
+  });
+
+  test('should handle cycles in recursive traversal gracefully', async () => {
+    const setup = await createGraph('disk', 'e2e-recursion-cycle');
+    g = setup.graph;
+    path = setup.path;
+
+    // Cycle: A -> B -> A
+    await g.addNode('A', ['Node']);
+    await g.addNode('B', ['Node']);
+    await g.addEdge('A', 'B', 'LOOP');
+    await g.addEdge('B', 'A', 'LOOP');
+
+    // Recursive traverse
+    // Rust implementation marks start node as visited, so it shouldn't be returned unless it's encountered again via a longer path (but BFS with visited set prevents re-visiting).
+    const res = await g.match(['Node'])
+      .where({ id: 'A' })
+      .out('LOOP').depth(1, 5)
+      .select(n => n.id);
+      
+    // A -> B (visited=A,B) -> A (skip)
+    expect(res).toEqual(['B']);
+  });
+
+  test('should handle merge (upsert) idempotently', async () => {
+    const setup = await createGraph('disk', 'e2e-merge');
+    g = setup.graph;
+    path = setup.path;
+
+    // 1. First Merge (Create)
+    // Matches if label='User' AND email='test@example.com'
+    const id1 = await g.mergeNode('User', { email: 'test@example.com' }, { name: 'Test User', loginCount: 1 });
+    
+    // Check in-memory index
+    const count1 = g.native.nodeCount;
+    expect(count1).toBe(1);
+    
+    // Check DB
+    const node1 = await g.match(['User']).where({ email: 'test@example.com' }).select();
+    expect(node1[0].name).toBe('Test User');
+    expect(node1[0].loginCount).toBe(1);
+
+    // 2. Second Merge (Update)
+    // Matches by email, updates loginCount
+    const id2 = await g.mergeNode('User', { email: 'test@example.com' }, { loginCount: 2 });
+    
+    // ID should be same
+    expect(id2).toBe(id1);
+    
+    // Count should remain 1
+    const count2 = g.native.nodeCount;
+    expect(count2).toBe(1); 
+
+    // Properties should be merged
+    const node2 = await g.match(['User']).where({ email: 'test@example.com' }).select();
+    expect(node2[0].loginCount).toBe(2);
+    expect(node2[0].name).toBe('Test User'); // Should persist
+  });
+
+  test('should throw error when depth is used without traversal', async () => {
+    const setup = await createGraph('memory');
+    g = setup.graph;
+
+    const query = () => g.match(['Node']).depth(1, 2);
+    expect(query).toThrow('depth() must be called after a traversal step');
+  });
+});
+````
+
+## File: test/integration/errors.test.ts
+````typescript
+import { describe, test, expect, afterEach } from 'bun:test';
+import { createGraph, cleanupGraph } from '../utils/helpers';
+import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+describe('Integration: Error Handling & Edge Cases', () => {
+  let g: QuackGraph;
+  let path: string;
+
+  afterEach(async () => {
+    if (path) await cleanupGraph(path);
+  });
+
+  test('should allow edges to non-existent nodes (Graph Pattern Matching behavior)', async () => {
+    // QuackGraph V1 is schemaless. It allows adding edges to nodes that haven't been explicitly created.
+    // However, since those nodes don't exist in the 'nodes' table, they should be filtered out 
+    // during the final hydration (SELECT * FROM nodes) step of the query builder.
+    
+    const setup = await createGraph('disk', 'int-errors');
+    g = setup.graph;
+    path = setup.path;
+
+    await g.addNode('real_node', ['Node']);
+    // Edge to phantom node
+    await g.addEdge('real_node', 'phantom_node', 'LINK');
+
+    // 1. Native Traversal should find it (Topology exists)
+    const nativeNeighbors = g.native.traverse(['real_node'], 'LINK', 'out');
+    expect(nativeNeighbors).toContain('phantom_node');
+
+    // 2. Query Builder should NOT return it (Data missing)
+    const neighbors = await g.match(['Node'])
+        .where({ id: 'real_node' })
+        .out('LINK')
+        .select(n => n.id);
+
+    expect(neighbors.length).toBe(0); 
+  });
+
+  test('should handle special characters in IDs', async () => {
+    const setup = await createGraph('disk', 'int-special-chars');
+    g = setup.graph;
+    path = setup.path;
+
+    const crazyId = 'Node/With"Quotes\'And\\Backslashes 🦆';
+    await g.addNode(crazyId, ['Node']);
+    await g.addNode('b', ['Node']);
+    await g.addEdge(crazyId, 'b', 'LINK');
+
+    const result = await g.match(['Node'])
+        .where({ id: crazyId })
+        .out('LINK')
+        .select(n => n.id);
+        
+    expect(result).toEqual(['b']);
+    
+    // Reverse check
+    const reverse = await g.match(['Node'])
+        .where({ id: 'b' })
+        .in('LINK')
+        .select(n => n.id);
+    
+    expect(reverse).toEqual([crazyId]);
+  });
+
+  test('should throw error when nearText is used without VSS extension', async () => {
+    const setup = await createGraph('disk', 'error-vss');
+    g = setup.graph;
+    path = setup.path;
+
+    // Force disable VSS capability
+    g.capabilities.vss = false;
+
+    // Attempt vector search
+    const promise = g.match(['Node'])
+      .nearText([1, 2, 3])
+      .select();
+
+    await expect(promise).rejects.toThrow('Vector search requires the DuckDB "vss" extension');
+  });
+});
 ````
 
 ## File: test/integration/persistence.test.ts
@@ -4041,6 +3507,373 @@ describe('Integration: Temporal Time-Travel', () => {
     expect(resT2).toEqual(['C']);
   });
 });
+````
+
+## File: README.md
+````markdown
+# QuackGraph 🦆🕸️
+
+[![npm version](https://img.shields.io/npm/v/quack-graph.svg?style=flat-square)](https://www.npmjs.com/package/quack-graph)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/your-repo/quack-graph/ci.yml?style=flat-square)](https://github.com/your-repo/quack-graph/actions)
+[![Runtime: Bun](https://img.shields.io/badge/Runtime-Bun%20%2F%20Node-black.svg?style=flat-square)](https://bun.sh)
+[![Engine: Rust](https://img.shields.io/badge/Accelerator-Rust%20(CSR)-orange.svg?style=flat-square)](https://www.rust-lang.org/)
+[![Storage: DuckDB](https://img.shields.io/badge/Storage-DuckDB-brightgreen.svg?style=flat-square)](https://duckdb.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
+
+> **The Embedded Graph Analytics Engine.**
+>
+> **Postgres is for records. QuackGraph is for relationships.**
+>
+> QuackGraph is a **serverless, infrastructure-less** graph index that runs alongside your app. It combines **DuckDB** (Columnar Storage) with a **Rust/Wasm CSR Index** (O(1) Traversal) via **Zero-Copy Apache Arrow**.
+>
+> No Docker containers. No JVM. Just `npm install` and raw speed.
+
+---
+
+## 📖 Table of Contents
+
+1.  [**Why QuackGraph? (The Pitch)**](#-why-quackgraph-the-pitch)
+2.  [**The Architecture: A "Split-Brain" Engine**](#-the-architecture-a-split-brain-engine)
+3.  [**Installation**](#-installation)
+4.  [**Quick Start (5 Minutes)**](#-quick-start-5-minutes)
+5.  [**Core Concepts**](#-core-concepts)
+    *   [Schemaless & Gradual Typing](#1-schemaless--gradual-typing)
+    *   [GraphRAG (Vector Search)](#2-graphrag-vector-search)
+    *   [Temporal Time-Travel](#3-temporal-time-travel)
+    *   [Complex Patterns & Recursion](#4-complex-patterns--recursion)
+    *   [Declarative Mutations](#5-declarative-mutations)
+6.  [**Advanced Usage & Performance Tuning**](#-advanced-usage--performance-tuning)
+    *   [Property Promotion](#property-promotion-json--native)
+    *   [Topology Snapshots](#topology-snapshots-for-instant-boot)
+    *   [Server-Side Aggregations](#server-side-aggregations)
+    *   [Cypher Compatibility](#cypher-compatibility)
+7.  [**Runtime Targets: Native vs. Edge**](#-runtime-targets-native-vs-edge)
+8.  [**Comparison with Alternatives**](#-comparison-with-alternatives)
+9.  [**Known Limits & Trade-offs**](#-known-limits--trade-offs)
+10. [**Contributing**](#-contributing)
+11. [**Roadmap**](#-roadmap)
+
+---
+
+## 💡 Why QuackGraph?
+
+**The "SQLite for Graphs" Moment.**
+
+Enterprises run Neo4j Clusters. Startups and Local-First apps don't have that luxury. You shouldn't need to deploy a heavy Java-based server just to query "friends of friends" or build a RAG pipeline.
+
+QuackGraph is **CQRS in a box**:
+1.  **Ingest:** Data lands in **DuckDB**. It's cheap, ACID-compliant, and handles millions of rows on a laptop.
+2.  **Index:** We project the topology into a **Rust Compressed Sparse Row (CSR)** structure in RAM.
+3.  **Query:** Graph traversals happen in nanoseconds (memory pointers), while heavy aggregations happen in DuckDB (vectorized SQL).
+
+**Use Cases:**
+*   **GraphRAG:** Combine Vector Search (HNSW) with Knowledge Graph traversal in a single process.
+*   **Fraud Detection:** Detect cycles and rings in transaction logs without network latency.
+*   **Local-First SaaS:** Ship complex analytics in Electron apps or Edge workers.
+
+---
+
+## 📐 Architecture: Zero-Copy Hybrid Engine
+
+QuackGraph is not a database replacement; it is a **Read-Optimized View**. It leverages **Apache Arrow** to stream data from Disk to RAM at ~1GB/s.
+
+```ascii
+[ Your App (Bun / Node / Wasm) ]
+     │
+     ▼
+[ QuackGraph DX Layer (TypeScript) ]
+     │
+     ├── Writes ───────────────┐
+     │                         ▼
+     │                 [ DuckDB Storage ] (Persistent Source of Truth)
+     │                 (Parquet / JSON / WAL)
+     │                         │
+     ├── Reads (Filters) ◄─────┤
+     │                         │
+     │                 (Arrow IPC Stream for Hydration)
+     │                         ▼
+     └── Reads (Hops) ◄── [ Rust Index ] (Transient In-Memory Cache)
+                          (CSR Topology)
+```
+
+1.  **DuckDB is King:** All writes (`addNode`, `addEdge`) go immediately and atomically to DuckDB.
+2.  **Rust is a View:** The In-Memory Graph Index is a *read-optimized, transient view* of the data on disk.
+3.  **Hydration:** On startup, we stream edges from DuckDB to Rust via Arrow IPC (~1M edges/sec).
+4.  **Consistency:** If the process crashes, the RAM index is gone. No data loss occurs because the data is safely in `.duckdb`.
+
+---
+
+## 📦 Installation
+
+Choose your runtime target.
+
+### 🏎️ Native (Backend / CLI)
+*Best for: Bun, Node.js, Electron, Tauri.*
+Uses `napi-rs` for native C++ performance.
+
+```bash
+bun add quack-graph
+```
+
+### 🌍 Edge (Serverless / Browser)
+*Best for: Cloudflare Workers, Vercel Edge, Local-First Web Apps.*
+Uses WebAssembly.
+
+```bash
+bun add quack-graph @duckdb/duckdb-wasm apache-arrow
+```
+
+---
+
+## ⚡ The API: Graph Topology meets SQL Analytics
+
+Stop writing 50-line `WITH RECURSIVE` SQL queries.
+QuackGraph gives you a Fluent TypeScript API for the topology, but lets you drop into raw SQL for the heavy lifting.
+
+**The "Hybrid" Query Pattern:**
+1.  **Graph Layer:** Use Rust to traverse hops instantly.
+2.  **SQL Layer:** Use DuckDB to aggregate the results.
+
+```typescript
+import { QuackGraph } from 'quack-graph';
+const g = new QuackGraph('./supply-chain.duckdb');
+
+// Scenario: "Find all downstream products affected by a bad Lithium batch,
+// and calculate the total inventory value at risk."
+
+const results = await g
+  // 1. Start: DuckDB Index Scan
+  .match(['Material'])
+  .where({ batch: 'BAD-BATCH-001' })
+
+  // 2. Traversal: Rust In-Memory CSR (Nanoseconds)
+  // Find everything this material flows into, up to 10 hops deep
+  .out('PART_OF').depth(1, 10)
+
+  // 3. Filter: Apply logic to the found nodes
+  .node(['Product'])
+  .where({ status: 'active' })
+
+  // 4. Analytics: Push aggregation down to DuckDB (Zero Data Transfer)
+  // We can write raw SQL inside .select()!
+  .select(`
+    id,
+    properties->>'name' as product_name,
+    (properties->>'price')::FLOAT * (properties->>'stock')::INT as value_at_risk
+  `);
+
+console.table(results);
+/*
+┌────────────┬──────────────┬───────────────┐
+│ id         │ product_name │ value_at_risk │
+├────────────┼──────────────┼───────────────┤
+│ prod:ev_1  │ Tesla Model3 │ 1500000       │
+│ prod:bat_x │ PowerWall    │ 45000         │
+└────────────┴──────────────┴───────────────┘
+*/
+```
+
+---
+
+## 🧠 Core Concepts
+
+### 1. Schemaless & Gradual Typing
+Start with `any`. Harden with `Zod`. QuackGraph stores properties as a `JSON` column in DuckDB, allowing instant iteration. When you need safety, bind a Schema.
+
+```typescript
+import { z } from 'zod';
+const UserSchema = z.object({ name: z.string(), role: z.enum(['Admin', 'User']) });
+
+const g = new QuackGraph('db.duckdb').withSchemas({ User: UserSchema });
+// TypeScript now provides strict autocomplete and runtime validation
+```
+
+### 2. GraphRAG (Vector Search)
+Build **Local-First AI** apps. QuackGraph bundles `duckdb_vss` (HNSW Indexing). Your graph *is* your vector store.
+
+```typescript
+// Find documents similar to [Query], then find who wrote them
+const authors = await g
+  .nearText(['Document'], queryVector, { limit: 10 }) // HNSW Search
+  .in('AUTHORED_BY')                                  // Graph Hop
+  .node(['User'])
+  .select(u => u.name);
+```
+
+### 3. Temporal Time-Travel
+The database is **Append-Only**. We never overwrite data; we version it. This gives you Git-like history for your data.
+
+```typescript
+// Oops, someone deleted the edges? Query the graph as it existed 10 minutes ago.
+const snapshot = g.asOf(new Date(Date.now() - 10 * 60 * 1000));
+const count = await snapshot.match(['User']).count();
+```
+
+### 4. Complex Patterns & Recursion
+Match Neo4j's expressiveness with fluent ergonomics.
+
+**Variable-Length Paths (Recursive):**
+```typescript
+// Find friends of friends (1 to 5 hops away)
+const network = await g.match(['User'])
+  .where({ id: 'Alice' })
+  .out('KNOWS').depth(1, 5)
+  .select(u => u.name);
+```
+
+**Pattern Matching (Isomorphism):**
+```typescript
+// Find a "Triangle" (A knows B, B knows C, C knows A)
+const triangles = await g.match(['User']).as('a')
+  .out('KNOWS').as('b')
+  .out('KNOWS').as('c')
+  .matchEdge('c', 'a', 'KNOWS') // Close the loop
+  .return(row => ({
+    a: row.a.name,
+    b: row.b.name,
+    c: row.c.name
+  }));
+```
+
+### 5. Declarative Mutations (Upserts)
+Don't write race-condition-prone check-then-insert code. We provide atomic `MERGE` semantics equivalent to Neo4j.
+
+```typescript
+// Idempotent Ingestion
+const userId = await g.mergeNode('User', { email: 'alice@corp.com' })
+  .match({ email: 'alice@corp.com' })   // Look up by unique key
+  .set({ last_seen: new Date() })       // Update if exists
+  .run();
+```
+
+### 6. Batch Ingestion
+For high-throughput scenarios, use batch operations to minimize transaction overhead.
+
+```typescript
+// Insert 10,000 nodes in one transaction
+await g.addNodes([
+  { id: 'u:1', labels: ['User'], properties: { name: 'Alice' } },
+  { id: 'u:2', labels: ['User'], properties: { name: 'Bob' } }
+]);
+
+// Insert 50,000 edges
+await g.addEdges([
+  { source: 'u:1', target: 'u:2', type: 'KNOWS', properties: { since: 2022 } }
+]);
+```
+
+---
+
+## 🛠️ Advanced Usage & Performance Tuning
+
+### Property Promotion (JSON -> Native)
+Filtering inside large JSON blobs is slower than native columns. QuackGraph can materialize hot fields for you.
+
+```typescript
+// Background migration: pulls 'age' out of the JSON blob into a native INTEGER column for 50x faster reads.
+await g.optimize.promoteProperty('User', 'age', 'INTEGER');
+```
+
+### Topology Snapshots (for Instant Boot)
+The "Hydration" phase can be slow for huge graphs. You can snapshot the in-memory Rust index to disk.
+
+```typescript
+// Save the RAM index to disk
+await g.optimize.saveTopologySnapshot('./topology.snapshot');
+
+// On next boot, load the snapshot instead of re-reading from DuckDB
+const g = new QuackGraph('./data.duckdb', { topologySnapshot: './topology.snapshot' });
+```
+
+### Server-Side Aggregations
+Don't pull data back to JS just to count it. Push the math to DuckDB.
+
+```typescript
+// "MATCH (u:User) RETURN u.city, count(u) as pop"
+const stats = await g.match(['User'])
+  .groupBy(u => u.city)
+  .count()
+  .as('pop')
+  .run();
+```
+
+### Cypher Compatibility
+For easy migration and interoperability, you can run raw Cypher queries.
+
+```typescript
+// (Roadmap v1.0)
+const results = await g.query(`
+  MATCH (u:User {name: 'Alice'})-[:MENTORS]->(mentee:User)
+  WHERE mentee.age < 30
+  RETURN mentee.name
+`);```
+
+---
+
+## 🎯 Runtime Targets: Native vs. Edge
+
+| Feature | **Native (Bun/Node)** | **Edge (Wasm)** |
+| :--- | :--- | :--- |
+| **Engine** | Rust (Napi-rs) | Rust (Wasm) |
+| **Performance** | 🚀 **Highest** | 🐇 Fast |
+| **Cold Start** | ~50ms | ~400ms (Wasm boot) |
+| **Max Memory** | System RAM | ~128MB (CF Workers) |
+| **Best For** | Backends, CLI, Desktop | Serverless, Browser, Local-First |
+
+---
+
+## 🆚 Comparison with Alternatives
+
+| Feature | QuackGraph 🦆 | Neo4j / TigerGraph | Raw SQL (Postgres/DuckDB) |
+| :--- | :--- | :--- | :--- |
+| **Deployment** | **`npm install`** | Docker / K8s Cluster | Docker / RDS |
+| **Architecture** | **Embedded Library** | Standalone Server | Database Engine |
+| **Latency** | **Nanoseconds (In-Proc)** | Milliseconds (Network) | Microseconds (IO) |
+| **Vector RAG**| **Native (HNSW)** | Plugin Required | Extension (pgvector) |
+| **Traversal** | **O(1) RAM Pointers** | O(1) RAM Pointers | O(log n) Index Joins |
+| **Cost** | **$0 / Compute Only** | $$ License / Cloud | $ Instance Cost |
+
+---
+
+## ⚠️ Known Limits & Trade-offs
+
+1.  **Memory Wall (Edge):**
+    *   On Cloudflare Workers (128MB limit), the Graph Index can hold **~200k edges** before OOM.
+    *   *Workaround:* Use integer IDs (`1001` vs `"user_uuid_v4"`) to save ~60% RAM.
+2.  **Concurrency:**
+    *   DuckDB is **Single-Writer**. This is not for high-concurrency OLTP (e.g., a Banking Ledger).
+    *   It is designed for **Read-Heavy / Analytic** workloads (RAG, Recommendations, Dashboards).
+3.  **Deep Pattern Matching:**
+    *   While we support basic isomorphism (triangles, rings), extremely large subgraph queries (>10 node patterns) are computationally expensive in any engine. We optimize for "OLTP-style" pattern matching (small local patterns) rather than whole-graph analytics.
+
+---
+
+## 🤝 Contributing
+
+We are building the standard library for Graph Data in TypeScript.
+This project is a Bun Workspace monorepo.
+
+1.  **Install:** `bun install`
+2.  **Build Native:** `cd packages/native && bun build`
+3.  **Run Tests:** `bun test`
+
+All contributions are welcome. Please open an issue to discuss your ideas.
+
+---
+
+## 🗓️ Roadmap
+
+*   ✅ **v0.1:** Core Engine (Native + Wasm).
+*   🟡 **v0.5:** **Recursion & Patterns.** Rust-side VF2 solver and Recursive DFS.
+*   ⚪️ **v1.0:** **Auto-Columnarization.** Background job that detects hot JSON fields and promotes them to native DuckDB columns.
+*   ⚪️ **v1.1:** **Cypher Parser.** `g.query('MATCH (n)-[:KNOWS]->(m) RETURN m')` for easy migration.
+*   ⚪️ **v1.2:** **Replication.** `g.sync('s3://bucket/graph')` for multi-device sync.
+
+---
+
+## 📄 License
+
+**MIT**
 ````
 
 ## File: packages/native/src/lib.rs
@@ -4432,14 +4265,204 @@ export class QuackGraph {
 }
 ````
 
+## File: packages/quack-graph/src/schema.ts
+````typescript
+import type { DuckDBManager, DbExecutor } from './db';
+
+const NODES_TABLE = `
+CREATE TABLE IF NOT EXISTS nodes (
+    row_id UBIGINT PRIMARY KEY, -- Simple auto-increment equivalent logic handled by sequence
+    id TEXT NOT NULL,
+    labels TEXT[],
+    properties JSON,
+    embedding DOUBLE[], -- Vector embedding
+    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
+    valid_to TIMESTAMPTZ DEFAULT NULL
+);
+CREATE SEQUENCE IF NOT EXISTS seq_node_id;
+`;
+
+const EDGES_TABLE = `
+CREATE TABLE IF NOT EXISTS edges (
+    source TEXT NOT NULL,
+    target TEXT NOT NULL,
+    type TEXT NOT NULL,
+    properties JSON,
+    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
+    valid_to TIMESTAMPTZ DEFAULT NULL
+);
+`;
+
+export class SchemaManager {
+  constructor(private db: DuckDBManager) {}
+
+  async ensureSchema() {
+    await this.db.execute(NODES_TABLE);
+    await this.db.execute(EDGES_TABLE);
+
+    // Performance Indexes
+    // Note: Partial indexes (WHERE valid_to IS NULL) are not supported in all DuckDB environments/bindings yet.
+    // We use standard indexes for now.
+    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_nodes_id ON nodes (id)');
+    // idx_nodes_labels removed: Standard B-Tree on LIST column does not help list_contains() queries.
+    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_edges_src_tgt_type ON edges (source, target, type)');
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: generic properties
+  async writeNode(id: string, labels: string[], properties: Record<string, any> = {}) {
+    await this.db.transaction(async (tx: DbExecutor) => {
+      // 1. Close existing record (SCD Type 2)
+      await tx.execute(
+        `UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`,
+        [id]
+      );
+      // 2. Insert new version
+      await tx.execute(`
+        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
+        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, (current_timestamp AT TIME ZONE 'UTC'), NULL)
+      `, [id, JSON.stringify(labels), JSON.stringify(properties)]);
+    });
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: generic properties
+  async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}) {
+    await this.db.transaction(async (tx: DbExecutor) => {
+      // 1. Close existing edge
+      await tx.execute(
+        `UPDATE edges SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+        [source, target, type]
+      );
+      // 2. Insert new version
+      await tx.execute(`
+        INSERT INTO edges (source, target, type, properties, valid_from, valid_to) 
+        VALUES (?, ?, ?, ?::JSON, (current_timestamp AT TIME ZONE 'UTC'), NULL)
+      `, [source, target, type, JSON.stringify(properties)]);
+    });
+  }
+
+  async deleteNode(id: string) {
+    // Soft Delete: Close the validity period
+    await this.db.transaction(async (tx: DbExecutor) => {
+      await tx.execute(
+        `UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`,
+        [id]
+      );
+    });
+  }
+
+  async deleteEdge(source: string, target: string, type: string) {
+    // Soft Delete: Close the validity period
+    await this.db.transaction(async (tx: DbExecutor) => {
+      await tx.execute(
+        `UPDATE edges SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+        [source, target, type]
+      );
+    });
+  }
+
+  /**
+   * Promotes a JSON property to a native column for faster filtering.
+   * This creates a column on the `nodes` table and backfills it from the `properties` JSON blob.
+   * 
+   * @param label The node label to target (e.g., 'User'). Only nodes with this label will be updated.
+   * @param property The property key to promote (e.g., 'age').
+   * @param type The DuckDB SQL type (e.g., 'INTEGER', 'VARCHAR').
+   */
+  async promoteNodeProperty(label: string, property: string, type: string) {
+    // Sanitize inputs to prevent basic SQL injection (rudimentary check)
+    if (!/^[a-zA-Z0-9_]+$/.test(property)) throw new Error(`Invalid property name: '${property}'. Must be alphanumeric + underscore.`);
+    // Type check is looser to allow various SQL types, but strictly alphanumeric + spaces/parens usually safe enough for now
+    if (!/^[a-zA-Z0-9_() ]+$/.test(type)) throw new Error(`Invalid SQL type: '${type}'.`);
+    // Sanitize label just in case, though it is used as a parameter usually, here we might need dynamic check if we were using it in table names, but we use it in list_contains param.
+    
+    // 1. Add Column (Idempotent)
+    try {
+      // Note: DuckDB 0.9+ supports ADD COLUMN IF NOT EXISTS
+      await this.db.execute(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ${property} ${type}`);
+    } catch (_e) {
+      // Fallback or ignore if column exists
+    }
+
+    // 2. Backfill Data
+    // We use list_contains to only update relevant nodes
+    const sql = `
+      UPDATE nodes 
+      SET ${property} = CAST(json_extract(properties, '$.${property}') AS ${type})
+      WHERE list_contains(labels, ?)
+    `;
+    await this.db.execute(sql, [label]);
+  }
+
+  /**
+   * Declarative Merge (Upsert).
+   * Finds a node by `matchProps` and `label`.
+   * If found: Updates properties with `setProps`.
+   * If not found: Creates new node with `matchProps` + `setProps`.
+   * Returns the node ID.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
+  async mergeNode(label: string, matchProps: Record<string, any>, setProps: Record<string, any>): Promise<string> {
+    // 1. Build Search Query
+    const matchKeys = Object.keys(matchProps);
+    const conditions = [`valid_to IS NULL`, `list_contains(labels, ?)`];
+    // biome-ignore lint/suspicious/noExplicitAny: Params array
+    const params: any[] = [label];
+    
+    for (const key of matchKeys) {
+      if (key === 'id') {
+        conditions.push(`id = ?`);
+        params.push(matchProps[key]);
+      } else {
+        conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+        params.push(JSON.stringify(matchProps[key]));
+      }
+    }
+
+    const searchSql = `SELECT id, labels, properties FROM nodes WHERE ${conditions.join(' AND ')} LIMIT 1`;
+
+    return await this.db.transaction(async (tx) => {
+      const rows = await tx.query(searchSql, params);
+      let id: string;
+      // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
+      let finalProps: Record<string, any>;
+      let finalLabels: string[];
+
+      if (rows.length > 0) {
+        // Update Existing
+        const row = rows[0];
+        id = row.id;
+        const currentProps = typeof row.properties === 'string' ? JSON.parse(row.properties) : row.properties;
+        finalProps = { ...currentProps, ...setProps };
+        finalLabels = row.labels; // Preserve existing labels
+
+        // Close old version
+        await tx.execute(`UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`, [id]);
+      } else {
+        // Insert New
+        id = matchProps.id || crypto.randomUUID();
+        finalProps = { ...matchProps, ...setProps };
+        finalLabels = [label];
+      }
+
+      // Insert new version (for both Update and Create cases)
+      await tx.execute(`
+        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
+        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, (current_timestamp AT TIME ZONE 'UTC'), NULL)
+      `, [id, JSON.stringify(finalLabels), JSON.stringify(finalProps)]);
+
+      return id;
+    });
+  }
+}
+````
+
 ## File: packages/quack-graph/src/query.ts
 ````typescript
 import type { QuackGraph } from './graph';
 
 type TraversalStep = {
-  type: 'out' | 'in' | 'recursive';
+  type: 'out' | 'in';
   edge: string;
-  direction?: 'out' | 'in';
   bounds?: { min: number; max: number };
 };
 
@@ -4473,22 +4496,20 @@ export class QueryBuilder {
   }
 
   /**
-   * Traverses the graph recursively (BFS) with depth bounds.
+   * Sets depth bounds for the last traversal step.
    * Useful for variable length paths like `(a)-[:KNOWS*1..5]->(b)`.
-   * @param edgeType The edge label to follow.
-   * @param options min/max depth (default: 1..5).
-   * @param direction 'out' (default) or 'in'.
+   * Must be called immediately after .out() or .in().
+   * @param min Minimum hops (default: 1)
+   * @param max Maximum hops (default: 1)
    */
-  recursive(edgeType: string, options: { min?: number; max?: number } = {}, direction: 'out' | 'in' = 'out'): this {
-    this.traversals.push({
-      type: 'recursive',
-      edge: edgeType,
-      direction,
-      bounds: {
-        min: options.min ?? 1,
-        max: options.max ?? 5,
-      }
-    });
+  depth(min: number, max: number): this {
+    if (this.traversals.length === 0) {
+      throw new Error("depth() must be called after a traversal step (.out() or .in())");
+    }
+    const lastIndex = this.traversals.length - 1;
+    // biome-ignore lint/style/noNonNullAssertion: length check above ensures array is not empty
+    const lastStep = this.traversals[lastIndex]!;
+    lastStep.bounds = { min, max };
     return this;
   }
 
@@ -4618,7 +4639,8 @@ export class QueryBuilder {
       if (!this.graph.capabilities.vss) {
         throw new Error('Vector search requires the DuckDB "vss" extension, which is not available or failed to load.');
       }
-      orderBy = `ORDER BY array_distance(embedding, ?::DOUBLE[])`;
+      const vectorSize = this.vectorSearch.vector.length;
+      orderBy = `ORDER BY array_distance(embedding, ?::DOUBLE[${vectorSize}])`;
       limit = `LIMIT ${this.vectorSearch.limit}`;
       params.push(JSON.stringify(this.vectorSearch.vector));
     }
@@ -4644,18 +4666,18 @@ export class QueryBuilder {
 
       if (currentIds.length === 0) break;
       
-      if (step.type === 'recursive') {
+      if (step.bounds) {
         currentIds = this.graph.native.traverseRecursive(
           currentIds,
           step.edge,
-          step.direction || 'out',
-          step.bounds?.min,
-          step.bounds?.max,
+          step.type,
+          step.bounds.min,
+          step.bounds.max,
           asOfTs
         );
       } else {
         // step.type is 'out' | 'in'
-        currentIds = this.graph.native.traverse(currentIds, step.edge, step.type as 'out' | 'in', asOfTs);
+        currentIds = this.graph.native.traverse(currentIds, step.edge, step.type, asOfTs);
       }
     }
 

@@ -46,7 +46,9 @@ export class QueryBuilder {
     if (this.traversals.length === 0) {
       throw new Error("depth() must be called after a traversal step (.out() or .in())");
     }
-    const lastStep = this.traversals[this.traversals.length - 1];
+    const lastIndex = this.traversals.length - 1;
+    // biome-ignore lint/style/noNonNullAssertion: length check above ensures array is not empty
+    const lastStep = this.traversals[lastIndex]!;
     lastStep.bounds = { min, max };
     return this;
   }
@@ -177,7 +179,8 @@ export class QueryBuilder {
       if (!this.graph.capabilities.vss) {
         throw new Error('Vector search requires the DuckDB "vss" extension, which is not available or failed to load.');
       }
-      orderBy = `ORDER BY array_distance(embedding, ?::DOUBLE[])`;
+      const vectorSize = this.vectorSearch.vector.length;
+      orderBy = `ORDER BY array_distance(embedding::DOUBLE[${vectorSize}], ?::DOUBLE[${vectorSize}])`;
       limit = `LIMIT ${this.vectorSearch.limit}`;
       params.push(JSON.stringify(this.vectorSearch.vector));
     }
