@@ -3,10 +3,29 @@ import { DuckDBManager } from './db';
 import { SchemaManager } from './schema';
 import { QueryBuilder } from './query';
 
+class WriteLock {
+  private mutex: Promise<void> = Promise.resolve();
+
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    // Chain the new operation to the existing promise
+    const result = this.mutex.then(() => fn());
+
+    // Update the mutex to wait for the new operation to complete (success or failure)
+    // We strictly return void so the mutex remains Promise<void>
+    this.mutex = result.then(
+      () => {},
+      () => {}
+    );
+
+    return result;
+  }
+}
+
 export class QuackGraph {
   db: DuckDBManager;
   schema: SchemaManager;
   native: NativeGraph;
+  private writeLock = new WriteLock();
   
   capabilities = {
     vss: false
@@ -70,10 +89,14 @@ export class QuackGraph {
    */
   async hydrate() {
     // Zero-Copy Arrow IPC
-    // 'valid_to IS NULL' ensures we only load currently active edges.
+    // We load ALL edges (active and historical) to support time-travel.
+    // We cast valid_from/valid_to to BIGINT (INT64) to ensure Arrow compatibility
     try {
       const ipcBuffer = await this.db.queryArrow(
-        "SELECT source, target, type FROM edges WHERE valid_to IS NULL"
+        `SELECT source, target, type, 
+                date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_from) as valid_from, 
+                date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_to) as valid_to 
+         FROM edges`
       );
     
       if (ipcBuffer && ipcBuffer.length > 0) {
@@ -110,32 +133,41 @@ export class QuackGraph {
 
   // biome-ignore lint/suspicious/noExplicitAny: generic properties
   async addNode(id: string, labels: string[], props: Record<string, any> = {}) {
-    // 1. Write to Disk (Source of Truth)
-    await this.schema.writeNode(id, labels, props);
-    // 2. Write to RAM (Cache)
-    this.native.addNode(id);
+    await this.writeLock.run(async () => {
+      // 1. Write to Disk (Source of Truth)
+      await this.schema.writeNode(id, labels, props);
+      // 2. Write to RAM (Cache)
+      this.native.addNode(id);
+    });
   }
 
   // biome-ignore lint/suspicious/noExplicitAny: generic properties
   async addEdge(source: string, target: string, type: string, props: Record<string, any> = {}) {
-    // 1. Write to Disk
-    await this.schema.writeEdge(source, target, type, props);
-    // 2. Write to RAM
-    this.native.addEdge(source, target, type);
+    await this.writeLock.run(async () => {
+      // 1. Write to Disk
+      await this.schema.writeEdge(source, target, type, props);
+      // 2. Write to RAM (Current time)
+      // We pass undefined for timestamps, so Rust defaults to (0, MAX) which is functionally "Active"
+      this.native.addEdge(source, target, type, undefined, undefined);
+    });
   }
 
   async deleteNode(id: string) {
-    // 1. Write to Disk (Soft Delete)
-    await this.schema.deleteNode(id);
-    // 2. Write to RAM (Tombstone)
-    this.native.removeNode(id);
+    await this.writeLock.run(async () => {
+      // 1. Write to Disk (Soft Delete)
+      await this.schema.deleteNode(id);
+      // 2. Write to RAM (Tombstone)
+      this.native.removeNode(id);
+    });
   }
 
   async deleteEdge(source: string, target: string, type: string) {
-    // 1. Write to Disk (Soft Delete)
-    await this.schema.deleteEdge(source, target, type);
-    // 2. Write to RAM (Remove)
-    this.native.removeEdge(source, target, type);
+    await this.writeLock.run(async () => {
+      // 1. Write to Disk (Soft Delete)
+      await this.schema.deleteEdge(source, target, type);
+      // 2. Write to RAM (Remove)
+      this.native.removeEdge(source, target, type);
+    });
   }
 
   /**
@@ -146,10 +178,12 @@ export class QuackGraph {
    */
   // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
   async mergeNode(label: string, matchProps: Record<string, any>, setProps: Record<string, any> = {}) {
-    const id = await this.schema.mergeNode(label, matchProps, setProps);
-    // Update cache
-    this.native.addNode(id);
-    return id;
+    return this.writeLock.run(async () => {
+      const id = await this.schema.mergeNode(label, matchProps, setProps);
+      // Update cache
+      this.native.addNode(id);
+      return id;
+    });
   }
 
   // --- Optimization & Maintenance ---

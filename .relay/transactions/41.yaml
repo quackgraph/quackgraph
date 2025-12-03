@@ -1,0 +1,1247 @@
+uuid: 4a2d8b1c-3f9e-4e5a-8d7c-9b1a2e3f4a5b
+projectId: quackgraph
+createdAt: '2025-12-02T13:42:16.937Z'
+gitCommitMsg: >-
+  docs: spec advanced Neo4j parity features (Recursion, Isomorphism, Upserts)
+
+  Updates the RFC to define architectural changes for the 'Graph Solver' (VF2
+  Algorithm), Recursive Traversals, and AST V2. Updates the README to showcase
+  the new Fluent API syntax for these advanced features.
+promptSummary: >-
+  Update RFC and README to spec out Neo4j parity features (Recursion,
+  Isomorphism, Upserts, Aggregations).
+reasoning:
+  - >-
+    The following changes upgrade the project specification and documentation to
+    include advanced graph features: **Recursive Traversals**, **Pattern
+    Matching (Isomorphism)**, **Declarative Mutations**, and **Server-Side
+    Aggregations**.
+  - '### 1. Update Architecture Specs (RFC)'
+  - >-
+    We define the new "Graph Solver" components in Rust (VF2 algorithm,
+    Recursive DFS) and upgrade the Query Planner to a Symbolic AST capable of
+    handling aliases and complex subgraphs.
+  - typescript
+  - 'g.match(''User'').where({ age: 25 }).out(''KNOWS'')'
+  - typescript
+  - g.match(['User']).as('a')
+  - .out('KNOWS').as('b')
+  - .out('KNOWS').as('c')
+  - .matchEdge('c', 'a', 'KNOWS') // Cycle
+  - .return('a', 'b', 'c')
+  - '### 2. Update Public Docs (README)'
+  - >-
+    We update the public README to highlight the new capabilities:
+    **Recursion**, **Patterns**, and **Declarative Mutations**, effectively
+    positioning QuackGraph as a viable Neo4j alternative.
+  - '---'
+  - '======='
+  - >-
+    // Oops, someone deleted the edges? Query the graph as it existed 10 minutes
+    ago.
+  - const snapshot = g.asOf(new Date(Date.now() - 10 * 60 * 1000));
+  - const count = await snapshot.match(['User']).count();
+  - typescript
+  - // Find friends of friends (1 to 5 hops away)
+  - const network = await g.match(['User'])
+  - '.where({ id: ''Alice'' })'
+  - '.recursive(''KNOWS'', { min: 1, max: 5 })'
+  - .select(u => u.name);
+  - typescript
+  - // Find a "Triangle" (A knows B, B knows C, C knows A)
+  - const triangles = await g.match(['User']).as('a')
+  - .out('KNOWS').as('b')
+  - .out('KNOWS').as('c')
+  - .matchEdge('c', 'a', 'KNOWS') // Close the loop
+  - .return(row => ({
+  - 'a: row.a.name,'
+  - 'b: row.b.name,'
+  - 'c: row.c.name'
+  - '}));'
+  - typescript
+  - // "MERGE" in Cypher
+  - 'await g.mergeNode(''User'', { email: ''alice@example.com'' })'
+  - '.onCreateSet({ createdAt: new Date(), name: ''Alice'' })'
+  - '.onMatchSet({ lastLogin: new Date() })'
+  - .run();
+  - typescript
+  - // (Roadmap v1.0)
+  - '======='
+  - '### Server-Side Aggregations'
+  - Don't pull data back to JS just to count it. Push the math to DuckDB.
+  - '### Cypher Compatibility'
+  - For easy migration and interoperability, you can run raw Cypher queries.
+operations:
+  - type: write
+    path: RFC.README.md
+    content: >
+      <<<<<<< SEARCH
+          // Bitmask for soft-deleted nodes (to avoid checking DuckDB for every hop)
+          tombstones: BitVec,
+      }
+
+      =======
+          // Bitmask for soft-deleted nodes (to avoid checking DuckDB for every hop)
+          tombstones: BitVec,
+      }
+
+
+      ### 3.3 The Graph Solver (Pattern Matching)
+
+      To match Neo4j's isomorphism capabilities (e.g., finding triangles or
+      specific shapes), we implement a **Subgraph Isomorphism Solver** in Rust.
+
+      *   **Algorithm:** VF2 or Backtracking DFS with state pruning.
+
+      *   **Input:** A query graph (small topology of what we look for).
+
+      *   **Execution:**
+          1.  Candidate Selection: Identify potential start nodes based on labels/properties (filtered by DuckDB).
+          2.  Matching: Rust engine expands candidates, checking structural constraints.
+          3.  Output: A set of matching path tuples `[(NodeA, NodeB, NodeC), ...]`.
+
+      ### 3.4 Recursive Engine
+
+      To support `MATCH (n)-[:KNOWS*1..5]->(m)`, the CSR index must support
+      depth-bounded traversals.
+
+      *   **Function:** `traverse_recursive(starts, type, min_depth,
+      max_depth)`.
+
+      *   **Visited Set:** Essential to prevent cycles in infinite recursions.
+
+      *   **Memory:** Using a bitset for `visited` is efficient given we intern
+      everything to `u32`.
+
+      >>>>>>> REPLACE
+
+      <<<<<<< SEARCH
+
+      ## 5. The Query Planner (`/packages/quack-graph`)
+
+
+      The TypeScript layer compiles the Fluent API into an **Execution Plan**.
+
+
+      **User Query:**
+    patchStrategy: search-replace
+  - type: write
+    path: '**Compilation Pipeline:**'
+    content: >-
+      1.  **AST Builder:** Captures steps into a JSON-like structure.
+
+      2.  **Optimizer (Reordering):**
+          *   *Rule:* **Filter First.** Push DuckDB filters (`where`) before Rust traversals (`out`) to reduce the starting set size.
+      3.  **Executor:** The "Sandwich" execution model.
+
+
+      **The Sandwich Model:**
+
+      1.  **DuckDB (Bottom Bun):**
+          *   Executes: `SELECT id FROM nodes WHERE properties->>'age' = 25`
+          *   Output: Arrow Vector `['u:1', 'u:5']`.
+      2.  **Rust (Meat):**
+          *   Input: `['u:1', 'u:5']`.
+          *   Action: Perform `.out('KNOWS')` traversal.
+          *   Output: `['u:99', 'u:100']`.
+      3.  **DuckDB (Top Bun) - Optional:**
+          *   If subsequent filters exist, query DuckDB again with new IDs.
+      =======
+
+      ## 5. The Query Planner (`/packages/quack-graph`)
+
+
+      The TypeScript layer compiles the Fluent API into an **Execution Plan (AST
+      V2)**.
+
+
+      **User Query:**
+    patchStrategy: replace
+  - type: write
+    path: '**Compilation Pipeline (The "Solver" Model):**'
+    content: >
+
+      1.  **Symbolic AST:** We track aliases (`a`, `b`) and their relationships.
+
+      2.  **Hybrid Optimization:**
+          *   **Filter Pushdown:** DuckDB narrows the candidate sets for `a`, `b`, and `c` based on properties.
+          *   **Pattern Extraction:** The topological constraints (`a->b`, `b->c`, `c->a`) are extracted into a "Pattern Query" for Rust.
+      3.  **Execution (Iterative Solver):**
+          *   **Step 1 (Candidates):** DuckDB fetches IDs for start nodes.
+          *   **Step 2 (Rust Solver):** The Rust engine runs VF2/Backtracking on the in-memory graph to find valid tuples `(id_a, id_b, id_c)`.
+          *   **Step 3 (Projection):** The resulting tuples are joined back with DuckDB to fetch properties (`RETURN a.name, c.age`).
+
+      **Aggregations & Grouping:**
+
+      Aggregations (`count`, `avg`, `collect`) are pushed down to DuckDB's SQL
+      engine on the final result set.
+
+      >>>>>>> REPLACE
+
+      <<<<<<< SEARCH
+
+      ### v0.8: Cypher Parser
+
+      *   **Problem:** DSL lock-in.
+
+      *   **Spec:** Use a PEG parser in Rust to parse Cypher strings into our
+      internal AST.
+
+      *   **Goal:** `g.query("MATCH (n)-[:KNOWS]->(m) RETURN m")`.
+
+      =======
+
+      ### v0.8: Declarative Mutations (Merge)
+
+      *   **Problem:** "Check-then-Act" logic in JS is slow and race-condition
+      prone.
+
+      *   **Spec:** Implement `MERGE` logic.
+          *   Locking: Optimistic concurrency control or single-threaded writer queue.
+          *   Logic: `INSERT ON CONFLICT DO UPDATE` generated in DuckDB.
+
+      ### v1.0: Cypher Parser
+
+      *   **Problem:** DSL lock-in.
+
+      *   **Spec:** Use a PEG parser in Rust to parse Cypher strings into our
+      internal AST.
+
+      *   **Goal:** `g.query("MATCH (n)-[:KNOWS]->(m) RETURN m")`.
+
+      >>>>>>> REPLACE
+    patchStrategy: search-replace
+  - type: write
+    path: README.md
+    content: >
+      <<<<<<< SEARCH
+          *   [Schemaless & Gradual Typing](#1-schemaless--gradual-typing)
+          *   [GraphRAG (Vector Search)](#2-graphrag-vector-search)
+          *   [Temporal Time-Travel](#3-temporal-time-travel)
+      6.  [**Advanced Usage & Performance
+      Tuning**](#-advanced-usage--performance-tuning)
+
+      =======
+          *   [Schemaless & Gradual Typing](#1-schemaless--gradual-typing)
+          *   [GraphRAG (Vector Search)](#2-graphrag-vector-search)
+          *   [Temporal Time-Travel](#3-temporal-time-travel)
+          *   [Complex Patterns & Recursion](#4-complex-patterns--recursion)
+          *   [Declarative Mutations](#5-declarative-mutations)
+      6.  [**Advanced Usage & Performance
+      Tuning**](#-advanced-usage--performance-tuning)
+
+      >>>>>>> REPLACE
+
+      <<<<<<< SEARCH
+
+      // Oops, someone deleted the edges? Query the graph as it existed 10
+      minutes ago.
+
+      const snapshot = g.asOf(new Date(Date.now() - 10 * 60 * 1000));
+
+      const count = await snapshot.match(['User']).count();
+    patchStrategy: search-replace
+  - type: write
+    path: '### 4. Complex Patterns & Recursion'
+    content: |-
+      Match Neo4j's expressiveness with fluent ergonomics.
+
+      **Variable-Length Paths (Recursive):**
+    patchStrategy: replace
+  - type: write
+    path: '**Pattern Matching (Isomorphism):**'
+    content: ''
+    patchStrategy: replace
+  - type: write
+    path: '### 5. Declarative Mutations'
+    content: |
+      Simplify your ingestion code with "Upsert" logic.
+    patchStrategy: replace
+  - type: write
+    path: '---'
+    content: |+
+      >>>>>>> REPLACE
+      <<<<<<< SEARCH
+      ### Cypher Compatibility
+      For easy migration and interoperability, you can run raw Cypher queries.
+
+    patchStrategy: search-replace
+  - type: write
+    path: MATCH (u:User) RETURN u.city, count(u) as pop
+    content: |-
+      const stats = await g.match(['User'])
+        .groupBy(u => u.city)
+        .count()
+        .as('pop')
+        .run();
+    patchStrategy: replace
+  - type: write
+    path: (Roadmap v1.0)
+    content: >
+      >>>>>>> REPLACE
+
+      <<<<<<< SEARCH
+
+      | **Traversals** | **O(1) Memory Ptrs** | O(1) Memory Ptrs | O(log n)
+      Joins |
+
+      | **Overhead** | **Low (Embedded)** | High (JVM) | Low (Embedded) |
+
+      =======
+
+      | **Traversals** | **O(1) Memory Ptrs** | O(1) Memory Ptrs | O(log n)
+      Joins |
+
+      | **Recursion** | **Yes (Rust DFS)** | Yes | Recursive CTEs (Slow) |
+
+      | **Patterns** | **Yes (VF2)** | Yes | N/A |
+
+      | **Overhead** | **Low (Embedded)** | High (JVM) | Low (Embedded) |
+
+      >>>>>>> REPLACE
+
+      <<<<<<< SEARCH
+
+      3.  **Deep Pattern Matching:**
+          *   We do not (yet) support complex subgraph isomorphism (e.g., finding all "Butterfly" patterns). We excel at pathfinding (BFS/DFS).
+      =======
+
+      3.  **Deep Pattern Matching:**
+          *   While we support basic isomorphism (triangles, rings), extremely large subgraph queries (>10 node patterns) are computationally expensive in any engine. We optimize for "OLTP-style" pattern matching (small local patterns) rather than whole-graph analytics.
+      >>>>>>> REPLACE
+
+      <<<<<<< SEARCH
+
+      *   ✅ **v0.1:** Core Engine (Native + Wasm).
+
+      *   🟡 **v0.5:** **Auto-Columnarization.** Background job that detects hot
+      JSON fields and promotes them to native DuckDB columns.
+
+      *   ⚪️ **v1.0:** **Cypher Parser.** `g.query('MATCH (n)-[:KNOWS]->(m)
+      RETURN m')` for easy migration.
+
+      =======
+
+      *   ✅ **v0.1:** Core Engine (Native + Wasm).
+
+      *   🟡 **v0.5:** **Recursion & Patterns.** Rust-side VF2 solver and
+      Recursive DFS.
+
+      *   ⚪️ **v1.0:** **Auto-Columnarization.** Background job that detects hot
+      JSON fields and promotes them to native DuckDB columns.
+
+      *   ⚪️ **v1.1:** **Cypher Parser.** `g.query('MATCH (n)-[:KNOWS]->(m)
+      RETURN m')` for easy migration.
+
+      >>>>>>> REPLACE
+    patchStrategy: search-replace
+snapshot:
+  '**Compilation Pipeline:**': null
+  '**Compilation Pipeline (The "Solver" Model):**': null
+  '### 4. Complex Patterns & Recursion': null
+  '**Pattern Matching (Isomorphism):**': null
+  '### 5. Declarative Mutations': null
+  '---': null
+  MATCH (u:User) RETURN u.city, count(u) as pop: null
+  (Roadmap v1.0): null
+  RFC.README.md: >
+    # RCC.README.md 🏗️
+
+
+    > **Project:** QuackGraph (Core Engine)
+
+    > **Stack:** Bun (Runtime) + Rust (Compute) + DuckDB (Storage)
+
+    > **Architecture:** "Split-Brain" (In-Memory CSR + On-Disk Columnar)
+
+    > **License:** MIT
+
+
+    ---
+
+
+    ## 1. The Core Philosophy (Engineering Constraints)
+
+
+    To maintain performance and the "Embedded" promise, we strictly adhere to
+    these constraints:
+
+
+    1.  **NO Garbage Collection in the Hot Path:** The traversal index must live
+    in Rust `Vec<T>` (Native) or Wasm Linear Memory. We never store topology in
+    JS Objects (`{ id: 'a', neighbors: [...] }`) to avoid V8 GC pauses.
+
+    2.  **NO Random Disk I/O:** Topology lives in RAM. Disk is only for
+    sequential columnar scans (DuckDB).
+
+    3.  **NO Serialization Overhead:** We do not serialize JSON between DuckDB
+    and Rust. We use **Apache Arrow** (IPC) pointers for Zero-Copy transfer.
+
+    4.  **DuckDB is the Source of Truth:** If the process crashes, RAM is lost.
+    On restart, we Hydrate RAM from DuckDB. Rust is a *Transient Cache*.
+
+    5.  **Append-Only Storage:** We never `UPDATE` or `DELETE` rows in DuckDB.
+    We insert new versions with `valid_from` timestamps.
+
+
+    ---
+
+
+    ## 2. Monorepo Structure
+
+
+    We use a **Bun Workspace** combined with a **Cargo Workspace**.
+
+
+    ```text
+
+    /quack-graph
+
+    ├── /packages
+
+    │   ├── /quack-graph        # Public TS API (The entry point)
+
+    │   ├── /native             # Napi-rs bindings (Node/Bun glue)
+
+    │   └── /wasm               # Wasm-bindgen bindings (Browser/Edge glue)
+
+    ├── /crates
+
+    │   └── /quack_core         # Shared Rust Logic (The "Brain")
+
+    │       ├── /src/topology.rs  # CSR Index
+
+    │       └── /src/interner.rs  # String <-> u32
+
+    ├── /benchmarks             # Performance testing suite
+
+    ├── Cargo.toml              # Rust Workspace
+
+    ├── package.json            # Bun Workspace
+
+    └── bun.lockb
+
+    ```
+
+
+    ---
+
+
+    ## 3. The Rust Core Spec (`/crates/quack_core`)
+
+
+    This code must compile to both **CDYLIB** (Native) and
+    **WASM32-UNKNOWN-UNKNOWN** (Edge).
+
+
+    ### 3.1 The String Interner
+
+    Since DuckDB uses `TEXT` IDs (UUIDs), but fast traversal requires `u32`
+    integers, we map them.
+
+
+    *   **Struct:** `BiMap` (Bidirectional Map).
+
+    *   **Forward:** `HashMap<String, u32>` (O(1) lookup).
+
+    *   **Reverse:** `Vec<String>` (Index lookup).
+
+    *   **Edge constraint:** On Cloudflare, `HashMap` overhead is significant.
+        *   *Optimization V2:* Use a Double-Array Trie or enforce integer IDs for large graphs.
+
+    ### 3.2 The Topology (Mutable CSR)
+
+    We use a hybrid Adjacency List that acts like a Compressed Sparse Row (CSR).
+
+
+    ```rust
+
+    pub struct GraphIndex {
+        // Forward Graph: Source u32 -> [(Target u32, Type u8)]
+        // We use Vec<Vec<>> for O(1) appends during hydration.
+        // Ideally, we compact this to flat Vec<u32> (CSR) after hydration.
+        outgoing: Vec<Vec<(u32, u8)>>, 
+        
+        // Reverse Graph: Target u32 -> [(Source u32, Type u8)]
+        // Required for .in() traversals
+        incoming: Vec<Vec<(u32, u8)>>,
+        
+        // Bitmask for soft-deleted nodes (to avoid checking DuckDB for every hop)
+        tombstones: BitVec,
+    }
+
+    ```
+
+
+    ---
+
+
+    ## 4. The Storage Spec (DuckDB)
+
+
+    We treat DuckDB as a **Log-Structured Merge Tree (LSM)** style store.
+
+
+    ### 4.1 Schema Definition
+
+
+    ```sql
+
+    -- NODES
+
+    CREATE TABLE nodes (
+        row_id UBIGINT PRIMARY KEY, -- Internal sequence for fast joins
+        id TEXT NOT NULL,           -- Public ID
+        labels TEXT[],              -- Multi-label support
+        properties JSON,            -- Schemaless payload
+        embedding FLOAT[1536],      -- Vector (HNSW)
+        
+        -- TEMPORAL COLUMNS
+        valid_from TIMESTAMP DEFAULT current_timestamp,
+        valid_to TIMESTAMP DEFAULT NULL -- NULL means 'Active'
+    );
+
+
+    -- EDGES
+
+    CREATE TABLE edges (
+        source TEXT NOT NULL,
+        target TEXT NOT NULL,
+        type TEXT NOT NULL,
+        properties JSON,
+        valid_from TIMESTAMP DEFAULT current_timestamp,
+        valid_to TIMESTAMP DEFAULT NULL
+    );
+
+    ```
+
+
+    ### 4.2 The Hydration Flow (Critical Path)
+
+    Startup time is the #1 KPI.
+
+
+    1.  **TS Layer:** Calls `duckdb.stream("SELECT source, target, type FROM
+    edges WHERE valid_to IS NULL")`.
+
+    2.  **TS Layer:** Receives **Apache Arrow RecordBatch** (C++ memory
+    pointer).
+
+    3.  **Bridge:** Passes the pointer to Rust via Napi/Wasm.
+
+    4.  **Rust Layer:**
+        *   Reads `source` column (String View). Interns to `u32`.
+        *   Reads `target` column (String View). Interns to `u32`.
+        *   Updates `GraphIndex`.
+    5.  **Target Speed:** 1 Million Edges / second processing rate.
+
+
+    ---
+
+
+    ## 5. The Query Planner (`/packages/quack-graph`)
+
+
+    The TypeScript layer compiles the Fluent API into an **Execution Plan**.
+
+
+    **User Query:**
+
+    ```typescript
+
+    g.match('User').where({ age: 25 }).out('KNOWS')
+
+    ```
+
+
+    **Compilation Pipeline:**
+
+
+    1.  **AST Builder:** Captures steps into a JSON-like structure.
+
+    2.  **Optimizer (Reordering):**
+        *   *Rule:* **Filter First.** Push DuckDB filters (`where`) before Rust traversals (`out`) to reduce the starting set size.
+    3.  **Executor:** The "Sandwich" execution model.
+
+
+    **The Sandwich Model:**
+
+    1.  **DuckDB (Bottom Bun):**
+        *   Executes: `SELECT id FROM nodes WHERE properties->>'age' = 25`
+        *   Output: Arrow Vector `['u:1', 'u:5']`.
+    2.  **Rust (Meat):**
+        *   Input: `['u:1', 'u:5']`.
+        *   Action: Perform `.out('KNOWS')` traversal.
+        *   Output: `['u:99', 'u:100']`.
+    3.  **DuckDB (Top Bun) - Optional:**
+        *   If subsequent filters exist, query DuckDB again with new IDs.
+
+    ---
+
+
+    ## 6. The Native Bridge (`/packages/native`)
+
+
+    We use `napi-rs` to expose Rust to Bun/Node.
+
+
+    ```rust
+
+    // packages/native/src/lib.rs
+
+    use napi_derive::napi;
+
+    use quack_core::GraphIndex;
+
+
+    #[napi]
+
+    pub struct NativeGraph {
+        inner: GraphIndex
+    }
+
+
+    #[napi]
+
+    impl NativeGraph {
+        #[napi(constructor)]
+        pub fn new() -> Self { ... }
+
+        // Fast Bulk Load via Arrow
+        #[napi]
+        pub fn load_arrow_batch(&mut self, buffer_ptr: BigInt) {
+            // Unsafe pointer magic to read Arrow batch from DuckDB
+        }
+
+        #[napi]
+        pub fn traverse(&self, start_ids: Vec<String>, edge_type: String) -> Vec<String> {
+            // Delegates to quack_core
+        }
+    }
+
+    ```
+
+
+    ---
+
+
+    ## 7. Development Workflow
+
+
+    ### Prerequisites
+
+    1.  **Bun:** `curl -fsSL https://bun.sh/install | bash`
+
+    2.  **Rust:** `rustup update`
+
+    3.  **LLVM/Clang:** Required for building DuckDB extensions (if compiling
+    from source).
+
+
+    ### Setup
+
+
+    ```bash
+
+    # 1. Install JS dependencies
+
+    bun install
+
+
+    # 2. Build the Rust Core & Bindings
+
+    # This runs cargo build inside /packages/native and /packages/wasm
+
+    bun run build:all
+
+
+    # 3. Run the Test Suite
+
+    # Uses Bun's native test runner (extremely fast)
+
+    bun test
+
+    ```
+
+
+    ### Running Benchmarks
+
+    We use a dedicated benchmark script to track regression in "Hydration" and
+    "Traversal" speeds.
+
+
+    ```bash
+
+    bun run bench
+
+    # Output:
+
+    # [Ingest] 100k nodes: 85ms
+
+    # [Hop] 3-depth traversal: 4ms
+
+    ```
+
+
+    ---
+
+
+    ## 8. Cross-Platform Strategy
+
+
+    ### Native (Backend)
+
+    *   **Tool:** `napi-rs`.
+
+    *   **Output:** `.node` binary file.
+
+    *   **Architecture:** We ship pre-built binaries for `linux-x64-gnu`,
+    `linux-x64-musl`, `darwin-x64`, `darwin-arm64`, `win32-x64`.
+
+
+    ### Edge (Wasm)
+
+    *   **Tool:** `wasm-pack`.
+
+    *   **Output:** `.wasm` file + JS glue.
+
+    *   **Constraint:** Wasm is single-threaded (mostly) and 32-bit address
+    space (4GB limit).
+
+    *   **Storage:** On Edge, DuckDB uses `HTTPFS` to read Parquet from S3/R2,
+    or `OPFS` in the browser.
+
+
+    ---
+
+
+    ## 9. Debugging & Profiling
+
+
+    ### Rust Panics
+
+    Rust panics will crash the Bun process. To debug:
+
+    ```bash
+
+    export RUST_BACKTRACE=1
+
+    bun test
+
+    ```
+
+
+    ### Memory Leaks
+
+    If `GraphIndex` grows indefinitely:
+
+    1.  Check `interner.rs`. Are we removing strings when nodes are deleted?
+    (Current design: No, we tombstone. Strings leak until restart).
+
+    2.  Check Napi `External` references. Are we properly dropping Rust structs
+    when JS objects are GC'd?
+
+
+    ---
+
+
+    ## 10. Future Proofing (Roadmap Specs)
+
+
+    ### v0.5: Topology Snapshots
+
+    *   **Problem:** Hydration takes too long for 10M+ edges.
+
+    *   **Spec:** Implement `GraphIndex::serialize()` using `bincode` or `rkyv`
+    (Zero-Copy deserialization framework).
+
+    *   **Flow:** Save `graph.bin` alongside `db.duckdb`. On boot, `mmap`
+    `graph.bin` directly into memory.
+
+
+    ### v0.8: Cypher Parser
+
+    *   **Problem:** DSL lock-in.
+
+    *   **Spec:** Use a PEG parser in Rust to parse Cypher strings into our
+    internal AST.
+
+    *   **Goal:** `g.query("MATCH (n)-[:KNOWS]->(m) RETURN m")`.
+
+
+    ### v1.0: Replication
+
+    *   **Problem:** Local-only limits usage.
+
+    *   **Spec:** Simple S3 sync.
+
+    *   **Command:** `g.sync.push('s3://bucket/latest')`.
+
+    *   **Logic:** Upload the `.duckdb` file and the `.bin` topology snapshot.
+    Clients pull and hot-reload.
+  README.md: >
+    # QuackGraph 🦆🕸️
+
+
+    [![npm
+    version](https://img.shields.io/npm/v/quack-graph.svg?style=flat-square)](https://www.npmjs.com/package/quack-graph)
+
+    [![Build
+    Status](https://img.shields.io/github/actions/workflow/status/your-repo/quack-graph/ci.yml?style=flat-square)](https://github.com/your-repo/quack-graph/actions)
+
+    [![Runtime:
+    Bun](https://img.shields.io/badge/Runtime-Bun%20%2F%20Node-black.svg?style=flat-square)](https://bun.sh)
+
+    [![Engine:
+    Rust](https://img.shields.io/badge/Accelerator-Rust%20(CSR)-orange.svg?style=flat-square)](https://www.rust-lang.org/)
+
+    [![Storage:
+    DuckDB](https://img.shields.io/badge/Storage-DuckDB-brightgreen.svg?style=flat-square)](https://duckdb.org/)
+
+    [![License:
+    MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
+
+
+    > **The Graph-Accelerated ORM for DuckDB.**
+
+    >
+
+    > Don't replace your database. **Supercharge it.**
+
+    > QuackGraph adds a zero-copy, in-memory Graph Index (CSR) on top of DuckDB,
+    giving you **O(1) traversals** and **Fluent TypeScript DX** without the JVM
+    overhead.
+
+
+    ---
+
+
+    ## 📖 Table of Contents
+
+
+    1.  [**Why QuackGraph? (The Pitch)**](#-why-quackgraph-the-pitch)
+
+    2.  [**The Architecture: A "Split-Brain"
+    Engine**](#-the-architecture-a-split-brain-engine)
+
+    3.  [**Installation**](#-installation)
+
+    4.  [**Quick Start (5 Minutes)**](#-quick-start-5-minutes)
+
+    5.  [**Core Concepts**](#-core-concepts)
+        *   [Schemaless & Gradual Typing](#1-schemaless--gradual-typing)
+        *   [GraphRAG (Vector Search)](#2-graphrag-vector-search)
+        *   [Temporal Time-Travel](#3-temporal-time-travel)
+    6.  [**Advanced Usage & Performance
+    Tuning**](#-advanced-usage--performance-tuning)
+        *   [Property Promotion](#property-promotion-json--native)
+        *   [Topology Snapshots](#topology-snapshots-for-instant-boot)
+        *   [Cypher Compatibility](#cypher-compatibility)
+    7.  [**Runtime Targets: Native vs. Edge**](#-runtime-targets-native-vs-edge)
+
+    8.  [**Comparison with Alternatives**](#-comparison-with-alternatives)
+
+    9.  [**Known Limits & Trade-offs**](#-known-limits--trade-offs)
+
+    10. [**Contributing**](#-contributing)
+
+    11. [**Roadmap**](#-roadmap)
+
+
+    ---
+
+
+    ## 💡 Why QuackGraph? (The Pitch)
+
+
+    **The Problem:**
+
+    1.  **Relational Databases (SQL)** are great at storage and math, but
+    terrible at connections. Writing `WITH RECURSIVE` CTEs is painful and slow.
+
+    2.  **Graph Databases (Neo4j)** are great at connections, but heavy to
+    deploy and they isolate your data in a proprietary silo.
+
+
+    **The Solution:**
+
+    QuackGraph is a **library**, not a server. It wraps your DuckDB file and
+    accelerates it.
+
+    *   **Storage:** We use **DuckDB** (Parquet/JSON) as the atomic Source of
+    Truth.
+
+    *   **Compute:** We maintain a transient **Rust/WASM Index** in RAM for
+    traversals.
+
+    *   **Speed:** We bridge them with **Apache Arrow** for Zero-Copy data
+    transfer.
+
+
+    **The Result:** You get the sub-millisecond traversal speed of a native
+    Graph DB with the simplicity and analytical power of DuckDB.
+
+
+    ---
+
+
+    ## 📐 The Architecture: A "Split-Brain" Engine
+
+
+    To ensure ACID compliance without building a complex distributed system,
+    QuackGraph follows a strict "Transient Cache" model.
+
+
+    ```ascii
+
+    [ Your App (Bun / Node / Wasm) ]
+         │
+         ▼
+    [ QuackGraph DX Layer (TypeScript) ]
+         │
+         ├── Writes ───────────────┐
+         │                         ▼
+         │                 [ DuckDB Storage ] (Persistent Source of Truth)
+         │                 (Parquet / JSON / WAL)
+         │                         │
+         ├── Reads (Filters) ◄─────┤
+         │                         │
+         │                 (Arrow IPC Stream for Hydration)
+         │                         ▼
+         └── Reads (Hops) ◄── [ Rust Index ] (Transient In-Memory Cache)
+                              (CSR Topology)
+    ```
+
+
+    1.  **DuckDB is King:** All writes (`addNode`, `addEdge`) go immediately and
+    atomically to DuckDB.
+
+    2.  **Rust is a View:** The In-Memory Graph Index is a *read-optimized,
+    transient view* of the data on disk.
+
+    3.  **Hydration:** On startup, we stream edges from DuckDB to Rust via Arrow
+    IPC (~1M edges/sec).
+
+    4.  **Consistency:** If the process crashes, the RAM index is gone. No data
+    loss occurs because the data is safely in `.duckdb`.
+
+
+    ---
+
+
+    ## 📦 Installation
+
+
+    Choose your runtime target.
+
+
+    ### 🏎️ Native (Backend / CLI)
+
+    *Best for: Bun, Node.js, Electron, Tauri.*
+
+    Uses `napi-rs` for native C++ performance.
+
+
+    ```bash
+
+    bun add quack-graph
+
+    ```
+
+
+    ### 🌍 Edge (Serverless / Browser)
+
+    *Best for: Cloudflare Workers, Vercel Edge, Local-First Web Apps.*
+
+    Uses WebAssembly.
+
+
+    ```bash
+
+    bun add quack-graph @duckdb/duckdb-wasm apache-arrow
+
+    ```
+
+
+    ---
+
+
+    ## 🚀 Quick Start (5 Minutes)
+
+
+    ```typescript
+
+    import { QuackGraph } from 'quack-graph';
+
+
+    // 1. Initialize (Wraps an existing or new DuckDB file)
+
+    const g = new QuackGraph('./analytics.duckdb');
+
+
+    // 2. Add Data (Writes go strictly to DuckDB WAL)
+
+    await g.addNode('u:1', ['User'], { name: 'Alice', age: 32 });
+
+    await g.addNode('u:2', ['User'], { name: 'Bob', age: 25 });
+
+    await g.addEdge('u:1', 'u:2', 'MENTORS', { since: 2024 });
+
+
+    // 3. Query (Traversals hit RAM, Filters hit Columnar Disk)
+
+    const results = await g
+      .match(['User'])
+      .where({ name: 'Alice' })   // DuckDB Index Scan
+      .out('MENTORS')             // Rust CSR Hop (Nanoseconds)
+      .node(['User'])
+      .where(u => u.age.lt(30))   // DuckDB Vectorized Filter
+      .select(u => ({
+        name: u.name,
+        age: u.age
+      }));
+
+    console.log(results);
+
+    // Output: [{ name: 'Bob', age: 25 }]
+
+    ```
+
+
+    ---
+
+
+    ## 🧠 Core Concepts
+
+
+    ### 1. Schemaless & Gradual Typing
+
+    Start with `any`. Harden with `Zod`. QuackGraph stores properties as a
+    `JSON` column in DuckDB, allowing instant iteration. When you need safety,
+    bind a Schema.
+
+
+    ```typescript
+
+    import { z } from 'zod';
+
+    const UserSchema = z.object({ name: z.string(), role: z.enum(['Admin',
+    'User']) });
+
+
+    const g = new QuackGraph('db.duckdb').withSchemas({ User: UserSchema });
+
+    // TypeScript now provides strict autocomplete and runtime validation
+
+    ```
+
+
+    ### 2. GraphRAG (Vector Search)
+
+    Build **Local-First AI** apps. QuackGraph bundles `duckdb_vss` (HNSW
+    Indexing). Your graph *is* your vector store.
+
+
+    ```typescript
+
+    // Find documents similar to [Query], then find who wrote them
+
+    const authors = await g
+      .nearText(['Document'], queryVector, { limit: 10 }) // HNSW Search
+      .in('AUTHORED_BY')                                  // Graph Hop
+      .node(['User'])
+      .select(u => u.name);
+    ```
+
+
+    ### 3. Temporal Time-Travel
+
+    The database is **Append-Only**. We never overwrite data; we version it.
+    This gives you Git-like history for your data.
+
+
+    ```typescript
+
+    // Oops, someone deleted the edges? Query the graph as it existed 10 minutes
+    ago.
+
+    const snapshot = g.asOf(new Date(Date.now() - 10 * 60 * 1000));
+
+    const count = await snapshot.match(['User']).count();
+
+    ```
+
+
+    ---
+
+
+    ## 🛠️ Advanced Usage & Performance Tuning
+
+
+    ### Property Promotion (JSON -> Native)
+
+    Filtering inside large JSON blobs is slower than native columns. QuackGraph
+    can materialize hot fields for you.
+
+
+    ```typescript
+
+    // Background migration: pulls 'age' out of the JSON blob into a native
+    INTEGER column for 50x faster reads.
+
+    await g.optimize.promoteProperty('User', 'age', 'INTEGER');
+
+    ```
+
+
+    ### Topology Snapshots (for Instant Boot)
+
+    The "Hydration" phase can be slow for huge graphs. You can snapshot the
+    in-memory Rust index to disk.
+
+
+    ```typescript
+
+    // Save the RAM index to disk
+
+    await g.optimize.saveTopologySnapshot('./topology.snapshot');
+
+
+    // On next boot, load the snapshot instead of re-reading from DuckDB
+
+    const g = new QuackGraph('./data.duckdb', { topologySnapshot:
+    './topology.snapshot' });
+
+    ```
+
+
+    ### Cypher Compatibility
+
+    For easy migration and interoperability, you can run raw Cypher queries.
+
+
+    ```typescript
+
+    // (Roadmap v1.0)
+
+    const results = await g.query(`
+      MATCH (u:User {name: 'Alice'})-[:MENTORS]->(mentee:User)
+      WHERE mentee.age < 30
+      RETURN mentee.name
+    `);```
+
+
+    ---
+
+
+    ## 🎯 Runtime Targets: Native vs. Edge
+
+
+    | Feature | **Native (Bun/Node)** | **Edge (Wasm)** |
+
+    | :--- | :--- | :--- |
+
+    | **Engine** | Rust (Napi-rs) | Rust (Wasm) |
+
+    | **Performance** | 🚀 **Highest** | 🐇 Fast |
+
+    | **Cold Start** | ~50ms | ~400ms (Wasm boot) |
+
+    | **Max Memory** | System RAM | ~128MB (CF Workers) |
+
+    | **Best For** | Backends, CLI, Desktop | Serverless, Browser, Local-First |
+
+
+    ---
+
+
+    ## 🆚 Comparison with Alternatives
+
+
+    | Feature | QuackGraph 🦆 | Neo4j | Raw DuckDB |
+
+    | :--- | :--- | :--- | :--- |
+
+    | **Identity** | **DX Library / Engine** | Database Server | Database Engine
+    |
+
+    | **Storage** | Single File (Local) | Proprietary | Single File (Local) |
+
+    | **Querying** | **Fluent TypeScript** | Cypher (String) | SQL (String) |
+
+    | **Vector Search**| **Native** | Plugin | Extension |
+
+    | **Traversals** | **O(1) Memory Ptrs** | O(1) Memory Ptrs | O(log n) Joins
+    |
+
+    | **Overhead** | **Low (Embedded)** | High (JVM) | Low (Embedded) |
+
+
+    ---
+
+
+    ## ⚠️ Known Limits & Trade-offs
+
+
+    1.  **Memory Wall (Edge):**
+        *   On Cloudflare Workers (128MB limit), the Graph Index can hold **~200k edges** before OOM.
+        *   *Workaround:* Use integer IDs (`1001` vs `"user_uuid_v4"`) to save ~60% RAM.
+    2.  **Concurrency:**
+        *   DuckDB is **Single-Writer**. This is not for high-concurrency OLTP (e.g., a Banking Ledger).
+        *   It is designed for **Read-Heavy / Analytic** workloads (RAG, Recommendations, Dashboards).
+    3.  **Deep Pattern Matching:**
+        *   We do not (yet) support complex subgraph isomorphism (e.g., finding all "Butterfly" patterns). We excel at pathfinding (BFS/DFS).
+
+    ---
+
+
+    ## 🤝 Contributing
+
+
+    We are building the standard library for Graph Data in TypeScript.
+
+    This project is a Bun Workspace monorepo.
+
+
+    1.  **Install:** `bun install`
+
+    2.  **Build Native:** `cd packages/native && bun build`
+
+    3.  **Run Tests:** `bun test`
+
+
+    All contributions are welcome. Please open an issue to discuss your ideas.
+
+
+    ---
+
+
+    ## 🗓️ Roadmap
+
+
+    *   ✅ **v0.1:** Core Engine (Native + Wasm).
+
+    *   🟡 **v0.5:** **Auto-Columnarization.** Background job that detects hot
+    JSON fields and promotes them to native DuckDB columns.
+
+    *   ⚪️ **v1.0:** **Cypher Parser.** `g.query('MATCH (n)-[:KNOWS]->(m) RETURN
+    m')` for easy migration.
+
+    *   ⚪️ **v1.2:** **Replication.** `g.sync('s3://bucket/graph')` for
+    multi-device sync.
+
+
+    ---
+
+
+    ## 📄 License
+
+
+    **MIT**
+approved: false
+linesAdded: null
+linesRemoved: null
+linesDifference: null
+gitCommittedAt: null
+status: undone
+id: 41

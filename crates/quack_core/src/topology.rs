@@ -9,6 +9,8 @@ use arrow::array::{AsArray, Array, StringArray, LargeStringArray};
 use arrow::datatypes::DataType;
 use arrow::compute::cast;
 
+pub const MAX_TIME: i64 = i64::MAX;
+
 /// The core Graph Index.
 /// Stores topology in RAM using integer IDs.
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -20,11 +22,11 @@ pub struct GraphIndex {
     edge_type_map: HashMap<String, u8>,
     edge_type_vec: Vec<String>,
 
-    // Forward Graph: Source Node ID -> List of (Target Node ID, Edge Type ID)
-    outgoing: Vec<Vec<(u32, u8)>>,
+    // Forward Graph: Source Node ID -> List of (Target Node ID, Edge Type ID, Valid From, Valid To)
+    outgoing: Vec<Vec<(u32, u8, i64, i64)>>,
     
-    // Reverse Graph: Target Node ID -> List of (Source Node ID, Edge Type ID)
-    incoming: Vec<Vec<(u32, u8)>>,
+    // Reverse Graph: Target Node ID -> List of (Source Node ID, Edge Type ID, Valid From, Valid To)
+    incoming: Vec<Vec<(u32, u8, i64, i64)>>,
 
     // Bitmask for soft-deleted nodes.
     // true = deleted (tombstone), false = active.
@@ -58,12 +60,21 @@ impl GraphIndex {
     }
 
     /// Compacts internal vectors to minimize memory usage.
+    /// Also sorts and deduplicates adjacency lists (essential after bulk loading).
     /// Should be called after bulk hydration.
     pub fn compact(&mut self) {
+        self.outgoing.iter_mut().for_each(|v| {
+            v.sort_unstable();
+            v.dedup();
+            v.shrink_to_fit();
+        });
+        self.incoming.iter_mut().for_each(|v| {
+            v.sort_unstable();
+            v.dedup();
+            v.shrink_to_fit();
+        });
         self.outgoing.shrink_to_fit();
-        self.outgoing.iter_mut().for_each(|v| v.shrink_to_fit());
         self.incoming.shrink_to_fit();
-        self.incoming.iter_mut().for_each(|v| v.shrink_to_fit());
         self.edge_type_vec.shrink_to_fit();
     }
 
@@ -126,21 +137,25 @@ impl GraphIndex {
 
     /// Adds an edge to the graph. 
     /// Idempotent: Does not add duplicate edges if they already exist.
-    pub fn add_edge(&mut self, source: &str, target: &str, edge_type: &str) {
+    /// If timestamps are not provided, defaults to (0, MAX_TIME).
+    pub fn add_edge(&mut self, source: &str, target: &str, edge_type: &str, valid_from: Option<i64>, valid_to: Option<i64>) {
+        let vf = valid_from.unwrap_or(0);
+        let vt = valid_to.unwrap_or(MAX_TIME);
+        
         let u_src = self.get_or_create_node(source);
         let u_tgt = self.get_or_create_node(target);
         let u_type = self.get_or_create_type(edge_type);
 
         // Add to forward index (Idempotent)
         let out_vec = &mut self.outgoing[u_src as usize];
-        if !out_vec.contains(&(u_tgt, u_type)) {
-            out_vec.push((u_tgt, u_type));
+        if !out_vec.contains(&(u_tgt, u_type, vf, vt)) {
+            out_vec.push((u_tgt, u_type, vf, vt));
         }
         
         // Add to reverse index (Idempotent)
         let in_vec = &mut self.incoming[u_tgt as usize];
-        if !in_vec.contains(&(u_src, u_type)) {
-            in_vec.push((u_src, u_type));
+        if !in_vec.contains(&(u_src, u_type, vf, vt)) {
+            in_vec.push((u_src, u_type, vf, vt));
         }
 
         // Ensure nodes are not tombstoned if they are being re-added/linked
@@ -161,15 +176,17 @@ impl GraphIndex {
             self.node_interner.lookup_id(target),
             self.edge_type_map.get(edge_type).copied(),
         ) {
+            // Note: In V2 Temporal, removing an edge usually means "closing" the validity window.
+            // However, this method removes it from RAM entirely (hard delete).
             // Remove from outgoing
             if let Some(edges) = self.outgoing.get_mut(u_src as usize) {
-                if let Some(pos) = edges.iter().position(|x| *x == (u_tgt, u_type)) {
+                if let Some(pos) = edges.iter().position(|x| x.0 == u_tgt && x.1 == u_type) {
                     edges.swap_remove(pos);
                 }
             }
             // Remove from incoming
             if let Some(edges) = self.incoming.get_mut(u_tgt as usize) {
-                if let Some(pos) = edges.iter().position(|x| *x == (u_src, u_type)) {
+                if let Some(pos) = edges.iter().position(|x| x.0 == u_src && x.1 == u_type) {
                     edges.swap_remove(pos);
                 }
             }
@@ -197,10 +214,9 @@ impl GraphIndex {
             match col.data_type() {
                 DataType::Utf8 | DataType::LargeUtf8 => Ok(col.clone()),
                 DataType::Dictionary(_key_type, value_type) => {
-                    // Check if the dictionary value type is a string type we can handle
                     match value_type.as_ref() {
+                        // If we need to support dictionary encoded strings
                         DataType::Utf8 | DataType::LargeUtf8 => {
-                            // Cast the dictionary to its underlying value type
                             cast(col.as_ref(), value_type.as_ref())
                                 .map_err(|e| format!("Cast error for {} column: {}", name, e))
                         },
@@ -216,6 +232,18 @@ impl GraphIndex {
         let src_col = prepare_col(batch.column(find_col("source")?), "Source")?;
         let tgt_col = prepare_col(batch.column(find_col("target")?), "Target")?;
         let type_col = prepare_col(batch.column(find_col("type")?), "Type")?;
+
+        // Optional Temporal Columns
+        // If missing, we default to (0, MAX_TIME)
+        let vf_idx = find_col("valid_from").ok();
+        let vt_idx = find_col("valid_to").ok();
+
+        let vf_col = if let Some(idx) = vf_idx {
+            Some(cast(batch.column(idx).as_ref(), &DataType::Int64).map_err(|e| e.to_string())?)
+        } else { None };
+        let vt_col = if let Some(idx) = vt_idx {
+            Some(cast(batch.column(idx).as_ref(), &DataType::Int64).map_err(|e| e.to_string())?)
+        } else { None };
 
         // Wrapper to handle different string array types (Utf8 vs LargeUtf8)
         enum StringArrayWrapper<'a> {
@@ -247,15 +275,48 @@ impl GraphIndex {
         let type_wrapper = get_wrapper!(type_col);
 
         for i in 0..num_rows {
-            self.add_edge(src_wrapper.value(i), tgt_wrapper.value(i), type_wrapper.value(i));
+            let src = src_wrapper.value(i);
+            let tgt = tgt_wrapper.value(i);
+            let edge_type = type_wrapper.value(i);
+
+            let u_src = self.get_or_create_node(src);
+            let u_tgt = self.get_or_create_node(tgt);
+            let u_type = self.get_or_create_type(edge_type);
+
+            // Extract timestamps
+            let valid_from = if let Some(ref col) = vf_col {
+                col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(i)
+            } else { 0 };
+
+            let valid_to = if let Some(ref col) = vt_col {
+                let arr = col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+                if arr.is_null(i) {
+                    MAX_TIME
+                } else {
+                    arr.value(i)
+                }
+            } else { MAX_TIME };
+
+            // Fast Path: Blind push. We rely on compact() to deduplicate later.
+            self.outgoing[u_src as usize].push((u_tgt, u_type, valid_from, valid_to));
+            self.incoming[u_tgt as usize].push((u_src, u_type, valid_from, valid_to));
+
+            // Ensure nodes are not tombstoned (revival logic)
+            if self.tombstones.get(u_src as usize).as_deref() == Some(&true) {
+                self.tombstones.set(u_src as usize, false);
+            }
+            if self.tombstones.get(u_tgt as usize).as_deref() == Some(&true) {
+                self.tombstones.set(u_tgt as usize, false);
+            }
         }
         Ok(())
     }
 
     /// Low-level neighbor access for Matcher.
     /// Returns all neighbors connected by `type_id` in `dir`.
+    /// Returns all neighbors connected by `type_id` in `dir`, respecting `as_of`.
     /// Filters out tombstoned neighbors.
-    pub fn get_neighbors(&self, node_id: u32, type_id: u8, dir: Direction) -> Vec<u32> {
+    pub fn get_neighbors(&self, node_id: u32, type_id: u8, dir: Direction, as_of: Option<i64>) -> Vec<u32> {
         let adjacency = match dir {
             Direction::Outgoing => &self.outgoing,
             Direction::Incoming => &self.incoming,
@@ -263,11 +324,21 @@ impl GraphIndex {
 
         if let Some(edges) = adjacency.get(node_id as usize) {
             edges.iter()
-                .filter_map(|&(target, t)| {
-                    if t == type_id && !self.is_node_deleted(target) {
-                        Some(target)
-                    } else {
-                        None
+                .filter_map(|&(target, t, vf, vt)| {
+                    // Type match
+                    if t != type_id { return None; }
+                    // Tombstone check
+                    if self.is_node_deleted(target) { return None; }
+                    
+                    // Temporal Check
+                    match as_of {
+                        Some(ts) => {
+                            if vf <= ts && vt > ts { Some(target) } else { None }
+                        },
+                        None => {
+                            // Current/Active only
+                            if vt == MAX_TIME { Some(target) } else { None }
+                        }
                     }
                 })
                 .collect()
@@ -278,8 +349,8 @@ impl GraphIndex {
 
     /// Generic traversal step (Bidirectional).
     /// Given a list of source node IDs (strings), find all neighbors connected by `edge_type`
-    /// in the specified `direction`.
-    pub fn traverse(&self, sources: &[String], edge_type: Option<&str>, direction: Direction) -> Vec<String> {
+    /// in the specified `direction`, visible at `as_of`.
+    pub fn traverse(&self, sources: &[String], edge_type: Option<&str>, direction: Direction, as_of: Option<i64>) -> Vec<String> {
         let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
         
         let mut result_ids: Vec<u32> = Vec::with_capacity(sources.len() * 2);
@@ -298,12 +369,17 @@ impl GraphIndex {
                 }
 
                 if let Some(edges) = adjacency.get(src_id as usize) {
-                    for &(target, type_id) in edges {
+                    for &(target, type_id, vf, vt) in edges {
                         // Apply edge type filter if present
                         if let Some(req_type) = type_filter {
                             if req_type != type_id {
                                 continue;
                             }
+                        }
+                        // Temporal Check
+                        match as_of {
+                            Some(ts) => { if !(vf <= ts && vt > ts) { continue; } },
+                            None => { if vt != MAX_TIME { continue; } }
                         }
                         // Check if target is deleted
                         if self.tombstones.get(target as usize).as_deref() == Some(&true) {
@@ -335,6 +411,7 @@ impl GraphIndex {
         direction: Direction,
         min_depth: usize,
         max_depth: usize,
+        as_of: Option<i64>,
     ) -> Vec<String> {
         let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
         
@@ -382,12 +459,18 @@ impl GraphIndex {
             let next_depth = curr_depth + 1;
 
             if let Some(edges) = adjacency.get(curr_id as usize) {
-                for &(target, type_id) in edges {
+                for &(target, type_id, vf, vt) in edges {
                     // Apply edge type filter
                     if let Some(req_type) = type_filter {
                         if req_type != type_id {
                             continue;
                         }
+                    }
+                    
+                    // Temporal Check
+                    match as_of {
+                        Some(ts) => { if !(vf <= ts && vt > ts) { continue; } },
+                        None => { if vt != MAX_TIME { continue; } }
                     }
                     
                     // Check soft delete
@@ -438,5 +521,41 @@ impl GraphIndex {
         let file = File::open(path).map_err(|e| e.to_string())?;
         let reader = BufReader::new(file);
         bincode::deserialize_from(reader).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bulk_add_dedup() {
+        let mut graph = GraphIndex::new();
+        
+        // Simulate batch loading with duplicates
+        // A -> B (KNOWS)
+        // A -> B (KNOWS)
+        // A -> B (LIKES)
+        
+        let u_a = graph.get_or_create_node("A");
+        let u_b = graph.get_or_create_node("B");
+        let t_knows = graph.get_or_create_type("KNOWS");
+        let t_likes = graph.get_or_create_type("LIKES");
+
+        // Manually push duplicates simulating blind batch add
+        graph.outgoing[u_a as usize].push((u_b, t_knows));
+        graph.outgoing[u_a as usize].push((u_b, t_knows)); // Duplicate
+        graph.outgoing[u_a as usize].push((u_b, t_likes)); // Different type
+
+        // Pre-compact: 3 edges
+        assert_eq!(graph.outgoing[u_a as usize].len(), 3);
+
+        // Compact
+        graph.compact();
+
+        // Post-compact: 2 edges (KNOWS, LIKES)
+        assert_eq!(graph.outgoing[u_a as usize].len(), 2);
+        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_knows)));
+        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_likes)));
     }
 }

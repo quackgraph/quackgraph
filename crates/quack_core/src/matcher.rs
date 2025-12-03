@@ -35,7 +35,7 @@ impl<'a> Matcher<'a> {
         }
     }
 
-    pub fn find_matches(&self, start_candidates: &[u32]) -> Vec<Vec<u32>> {
+    pub fn find_matches(&self, start_candidates: &[u32], as_of: Option<i64>) -> Vec<Vec<u32>> {
         let mut results = Vec::new();
         let mut assignment = vec![None; self.num_vars];
         let mut used_nodes = HashSet::new();
@@ -48,7 +48,7 @@ impl<'a> Matcher<'a> {
             assignment[0] = Some(start_node);
             used_nodes.insert(start_node);
             
-            self.backtrack(1, &mut assignment, &mut used_nodes, &mut results);
+            self.backtrack(1, &mut assignment, &mut used_nodes, &mut results, as_of);
             
             used_nodes.remove(&start_node);
             assignment[0] = None;
@@ -63,6 +63,7 @@ impl<'a> Matcher<'a> {
         assignment: &mut Vec<Option<u32>>,
         used_nodes: &mut HashSet<u32>,
         results: &mut Vec<Vec<u32>>,
+        as_of: Option<i64>,
     ) {
         if current_var == self.num_vars {
             results.push(assignment.iter().map(|opt| opt.unwrap()).collect());
@@ -74,13 +75,13 @@ impl<'a> Matcher<'a> {
         for edge in self.pattern {
             if edge.src_var < current_var && edge.tgt_var == current_var {
                 let known_node = assignment[edge.src_var].unwrap();
-                let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Outgoing);
+                let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Outgoing, as_of);
                 candidates = self.intersect(candidates, neighbors);
                 if candidates.as_ref().is_some_and(|c| c.is_empty()) { return; }
             }
             else if edge.src_var == current_var && edge.tgt_var < current_var {
                 let known_node = assignment[edge.tgt_var].unwrap();
-                let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Incoming);
+                let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Incoming, as_of);
                 candidates = self.intersect(candidates, neighbors);
                 if candidates.as_ref().is_some_and(|c| c.is_empty()) { return; }
             }
@@ -92,7 +93,7 @@ impl<'a> Matcher<'a> {
                     assignment[current_var] = Some(cand);
                     used_nodes.insert(cand);
                     
-                    self.backtrack(current_var + 1, assignment, used_nodes, results);
+                    self.backtrack(current_var + 1, assignment, used_nodes, results, as_of);
                     
                     used_nodes.remove(&cand);
                     assignment[current_var] = None;

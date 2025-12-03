@@ -34,6 +34,7 @@ impl NativeGraph {
 
     /// Hydrates the graph from an Arrow IPC stream (Buffer).
     /// Zero-copy (mostly) data transfer from DuckDB.
+    /// Note: Does not verify duplicates. Caller must call compact() afterwards.
     #[napi]
     pub fn load_arrow_ipc(&mut self, buffer: Buffer) -> napi::Result<()> {
         let cursor = Cursor::new(buffer.as_ref());
@@ -48,14 +49,18 @@ impl NativeGraph {
 
     /// Compacts the graph's memory usage.
     /// Call this after hydration to reclaim unused capacity in the adjacency lists.
+    /// Also deduplicates edges added via bulk ingestion.
     #[napi]
     pub fn compact(&mut self) {
         self.inner.compact();
     }
 
     #[napi]
-    pub fn add_edge(&mut self, source: String, target: String, edge_type: String) {
-        self.inner.add_edge(&source, &target, &edge_type);
+    pub fn add_edge(&mut self, source: String, target: String, edge_type: String, valid_from: Option<f64>, valid_to: Option<f64>) {
+        // JS timestamps are millis (f64). Convert to micros (i64) for DuckDB compatibility.
+        let vf = valid_from.map(|t| (t * 1000.0) as i64);
+        let vt = valid_to.map(|t| (t * 1000.0) as i64);
+        self.inner.add_edge(&source, &target, &edge_type, vf, vt);
     }
 
     #[napi]
@@ -71,18 +76,20 @@ impl NativeGraph {
     /// Performs a single-hop traversal (bfs-step).
     /// Returns unique neighbor IDs.
     #[napi]
-    pub fn traverse(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>) -> Vec<String> {
+    pub fn traverse(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>, as_of: Option<f64>) -> Vec<String> {
         let dir = match direction.as_deref() {
             Some("in") | Some("IN") => Direction::Incoming,
             _ => Direction::Outgoing,
         };
-        self.inner.traverse(&sources, edge_type.as_deref(), dir)
+        // Convert JS millis -> Rust micros
+        let ts = as_of.map(|t| (t * 1000.0) as i64);
+        self.inner.traverse(&sources, edge_type.as_deref(), dir, ts)
     }
 
     /// Performs a recursive traversal (BFS) with depth bounds.
     /// Returns unique node IDs reachable within [min_depth, max_depth].
     #[napi(js_name = "traverseRecursive")]
-    pub fn traverse_recursive(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>, min_depth: Option<u32>, max_depth: Option<u32>) -> Vec<String> {
+    pub fn traverse_recursive(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>, min_depth: Option<u32>, max_depth: Option<u32>, as_of: Option<f64>) -> Vec<String> {
         let dir = match direction.as_deref() {
             Some("in") | Some("IN") => Direction::Incoming,
             _ => Direction::Outgoing,
@@ -90,14 +97,15 @@ impl NativeGraph {
         
         let min = min_depth.unwrap_or(1) as usize;
         let max = max_depth.unwrap_or(1) as usize;
+        let ts = as_of.map(|t| (t * 1000.0) as i64);
         
-        self.inner.traverse_recursive(&sources, edge_type.as_deref(), dir, min, max)
+        self.inner.traverse_recursive(&sources, edge_type.as_deref(), dir, min, max, ts)
     }
 
     /// Finds subgraphs matching the given pattern.
     /// `start_ids` maps to variable 0 in the pattern.
     #[napi(js_name = "matchPattern")]
-    pub fn match_pattern(&self, start_ids: Vec<String>, pattern: Vec<JsPatternEdge>) -> Vec<Vec<String>> {
+    pub fn match_pattern(&self, start_ids: Vec<String>, pattern: Vec<JsPatternEdge>, as_of: Option<f64>) -> Vec<Vec<String>> {
         let mut core_pattern = Vec::with_capacity(pattern.len());
         for p in pattern {
             if let Some(type_id) = self.inner.get_type_id(&p.edge_type) {
@@ -123,8 +131,9 @@ impl NativeGraph {
             return Vec::new();
         }
 
+        let ts = as_of.map(|t| (t * 1000.0) as i64);
         let matcher = Matcher::new(&self.inner, &core_pattern);
-        let raw_results = matcher.find_matches(&start_candidates);
+        let raw_results = matcher.find_matches(&start_candidates, ts);
 
         raw_results.into_iter().map(|row| {
             row.into_iter().filter_map(|uid| self.inner.lookup_str(uid).map(|s| s.to_string())).collect()

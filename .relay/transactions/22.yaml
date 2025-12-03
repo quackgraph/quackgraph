@@ -1,0 +1,788 @@
+uuid: 44b7f8c0-3889-4d37-8f52-87c268a7b8e1
+projectId: quackgraph
+createdAt: '2025-12-02T10:04:27.783Z'
+gitCommitMsg: >-
+  fix: resolve clippy and biome lint errors
+
+  - Implements Default for NativeGraph - Removes redundant closures in Rust
+  map_err calls - Adds missing type imports in query.ts - Suppresses unavoidable
+  any types in DB/Query layers - Removes unused suppression in graph.ts
+promptSummary: Fix linting errors in Rust (clippy) and TypeScript (Biome) files.
+reasoning:
+  - Here are the patches to fix the linting and clippy errors.
+  - '### 1. Fix Rust Clippy Errors'
+  - >-
+    We need to implement `Default` for `NativeGraph` and remove redundant
+    closures in `map_err`.
+  - '### 2. Fix TypeScript Lint Errors in `query.ts`'
+  - We fix the import type and suppress necessary `any` usage.
+  - '### 3. Fix TypeScript Lint Errors in `db.ts`'
+  - >-
+    We suppress `any` usage for the `conn` object which has poor typing from the
+    library.
+  - '### 4. Fix TypeScript Lint Errors in `graph.ts`'
+  - We remove the unused suppression comment.
+  - '### Final Configuration'
+operations:
+  - type: write
+    path: packages/native/src/lib.rs
+    content: >
+      --- packages/native/src/lib.rs
+
+      +++ packages/native/src/lib.rs
+
+      @@ -19,6 +19,12 @@
+           }
+       
+      +    #[napi]
+           #[napi]
+           pub fn add_node(&mut self, id: String) {
+               self.inner.get_or_create_node(&id);
+      @@ -35,7 +41,7 @@
+       
+               for batch in reader {
+                   let batch = batch.map_err(|e| napi::Error::from_reason(e.to_string()))?;
+      -            self.inner.add_arrow_batch(&batch).map_err(|e|
+      napi::Error::from_reason(e))?;
+
+      +           
+      self.inner.add_arrow_batch(&batch).map_err(napi::Error::from_reason)?;
+               }
+               Ok(())
+           }
+      @@ -89,12 +95,18 @@
+       
+           #[napi]
+           pub fn save_snapshot(&self, path: String) -> napi::Result<()> {
+      -        self.inner.save_to_file(&path).map_err(|e|
+      napi::Error::from_reason(e))
+
+      +        self.inner.save_to_file(&path).map_err(napi::Error::from_reason)
+           }
+       
+           #[napi]
+           pub fn load_snapshot(&mut self, path: String) -> napi::Result<()> {
+      -        let loaded = GraphIndex::load_from_file(&path).map_err(|e|
+      napi::Error::from_reason(e))?;
+
+      +        let loaded =
+      GraphIndex::load_from_file(&path).map_err(napi::Error::from_reason)?;
+               self.inner = loaded;
+               Ok(())
+           }
+       }
+      +
+
+      +impl Default for NativeGraph {
+
+      +    fn default() -> Self {
+
+      +        Self::new()
+
+      +    }
+
+      +}
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/query.ts
+    content: |
+      --- packages/quack-graph/src/query.ts
+      +++ packages/quack-graph/src/query.ts
+      @@ -1,3 +1,3 @@
+      -import { QuackGraph } from './graph';
+      +import type { QuackGraph } from './graph';
+       
+       type TraversalStep = {
+      @@ -13,4 +13,5 @@
+         // Bottom Bun Filters (Initial selection)
+      +  // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+         private initialFilters: Record<string, any> = {};
+         private vectorSearch: { vector: number[]; limit: number } | null = null;
+      @@ -20,4 +21,5 @@
+         // Top Bun Filters (Final selection)
+      +  // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+         private terminalFilters: Record<string, any> = {};
+       
+      @@ -32,4 +34,5 @@
+          * If called after traversal, applies to End Nodes.
+          */
+      +  // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+         where(criteria: Record<string, any>): this {
+           if (this.traversals.length === 0) {
+      @@ -82,4 +85,5 @@
+         }
+       
+      +  // biome-ignore lint/suspicious/noExplicitAny: Generic result mapper
+         async select<T = any>(mapper?: (node: any) => T): Promise<T[]> {
+           // --- Step 1: DuckDB Filter (Bottom Bun) ---
+      @@ -87,4 +91,5 @@
+       
+           let query = `SELECT id FROM nodes`;
+      +    // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+           const params: any[] = [];
+           const conditions: string[] = [];
+      @@ -150,4 +155,5 @@
+           const finalConditions: string[] = [];
+      +    // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+           const finalParams: any[] = [];
+       
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/db.ts
+    content: >
+      --- packages/quack-graph/src/db.ts
+
+      +++ packages/quack-graph/src/db.ts
+
+      @@ -81,6 +81,8 @@
+           } finally {
+             // Best effort close
+      +      // biome-ignore lint/suspicious/noExplicitAny: DuckDB connection
+      types are incomplete
+             if (conn && typeof (conn as any).close === 'function') {
+      +        // biome-ignore lint/suspicious/noExplicitAny: DuckDB connection
+      types are incomplete
+               (conn as any).close();
+             }
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/graph.ts
+    content: >
+      --- packages/quack-graph/src/graph.ts
+
+      +++ packages/quack-graph/src/graph.ts
+
+      @@ -82,5 +82,4 @@
+                // Buffer.from is zero-copy in Node for Uint8Array usually, or cheap copy
+                // We cast to any to satisfy the generated TS definitions which might expect Buffer
+      -         // biome-ignore lint/suspicious/noExplicitAny: Buffer cast
+      compatibility for NAPI
+                const bufferForNapi = Buffer.isBuffer(ipcBuffer) 
+                   ? ipcBuffer 
+    patchStrategy: standard-diff
+snapshot:
+  packages/native/src/lib.rs: |-
+    #![deny(clippy::all)]
+
+    use napi::bindgen_prelude::*;
+    use napi_derive::napi;
+    use quack_core::{GraphIndex, Direction};
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    #[napi]
+    pub struct NativeGraph {
+        inner: GraphIndex,
+    }
+
+    #[napi]
+    impl NativeGraph {
+        #[napi(constructor)]
+        pub fn new() -> Self {
+            Self {
+                inner: GraphIndex::new(),
+            }
+        }
+
+        #[napi]
+        pub fn add_node(&mut self, id: String) {
+            self.inner.get_or_create_node(&id);
+        }
+
+        /// Hydrates the graph from an Arrow IPC stream (Buffer).
+        /// Zero-copy (mostly) data transfer from DuckDB.
+        #[napi]
+        pub fn load_arrow_ipc(&mut self, buffer: Buffer) -> napi::Result<()> {
+            let cursor = Cursor::new(buffer.as_ref());
+            let reader = StreamReader::try_new(cursor, None).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+            for batch in reader {
+                let batch = batch.map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                self.inner.add_arrow_batch(&batch).map_err(|e| napi::Error::from_reason(e))?;
+            }
+            Ok(())
+        }
+
+        /// Compacts the graph's memory usage.
+        /// Call this after hydration to reclaim unused capacity in the adjacency lists.
+        #[napi]
+        pub fn compact(&mut self) {
+            self.inner.compact();
+        }
+
+        #[napi]
+        pub fn add_edge(&mut self, source: String, target: String, edge_type: String) {
+            self.inner.add_edge(&source, &target, &edge_type);
+        }
+
+        #[napi]
+        pub fn remove_node(&mut self, id: String) {
+            self.inner.remove_node(&id);
+        }
+
+        #[napi]
+        pub fn remove_edge(&mut self, source: String, target: String, edge_type: String) {
+            self.inner.remove_edge(&source, &target, &edge_type);
+        }
+
+        /// Performs a single-hop traversal (bfs-step).
+        /// Returns unique neighbor IDs.
+        #[napi]
+        pub fn traverse(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>) -> Vec<String> {
+            let dir = match direction.as_deref() {
+                Some("in") | Some("IN") => Direction::Incoming,
+                _ => Direction::Outgoing,
+            };
+            self.inner.traverse(&sources, edge_type.as_deref(), dir)
+        }
+
+        /// Returns the number of nodes in the interned index.
+        /// Useful for debugging hydration.
+        #[napi(getter)]
+        pub fn node_count(&self) -> u32 {
+            // We cast to u32 because exposing usize to JS can be finicky depending on napi version,
+            // though napi usually handles numbers well. Safe for V1.
+            self.inner.node_count() as u32
+        }
+
+        #[napi(getter)]
+        pub fn edge_count(&self) -> u32 {
+            self.inner.edge_count() as u32
+        }
+
+        #[napi]
+        pub fn save_snapshot(&self, path: String) -> napi::Result<()> {
+            self.inner.save_to_file(&path).map_err(|e| napi::Error::from_reason(e))
+        }
+
+        #[napi]
+        pub fn load_snapshot(&mut self, path: String) -> napi::Result<()> {
+            let loaded = GraphIndex::load_from_file(&path).map_err(|e| napi::Error::from_reason(e))?;
+            self.inner = loaded;
+            Ok(())
+        }
+    }
+  packages/quack-graph/src/db.ts: >-
+    import { Database } from 'duckdb-async';
+
+
+    // Interface for operations that can be performed within a transaction or
+    globally
+
+    export interface DbExecutor {
+      // biome-ignore lint/suspicious/noExplicitAny: SQL params are generic
+      execute(sql: string, params?: any[]): Promise<void>;
+      // biome-ignore lint/suspicious/noExplicitAny: SQL results are generic
+      query(sql: string, params?: any[]): Promise<any[]>;
+    }
+
+
+    export class DuckDBManager implements DbExecutor {
+      private db: Database | null = null;
+      private _path: string;
+
+      constructor(path: string = ':memory:') {
+        this._path = path;
+      }
+
+      async init() {
+        if (!this.db) {
+          this.db = await Database.create(this._path);
+        }
+      }
+
+      get path(): string {
+        return this._path;
+      }
+
+      getDb(): Database {
+        if (!this.db) {
+          throw new Error('Database not initialized. Call init() first.');
+        }
+        return this.db;
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: SQL params
+      async execute(sql: string, params: any[] = []): Promise<void> {
+        const db = this.getDb();
+        await db.run(sql, params);
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: SQL results
+      async query(sql: string, params: any[] = []): Promise<any[]> {
+        const db = this.getDb();
+        return await db.all(sql, params);
+      }
+
+      /**
+       * Executes a callback within a transaction using a dedicated connection.
+       * This guarantees that all operations inside the callback share the same ACID scope.
+       */
+      async transaction<T>(callback: (executor: DbExecutor) => Promise<T>): Promise<T> {
+        const db = this.getDb();
+        const conn = await db.connect();
+        
+        // Create a transaction-bound executor wrapper
+        const txExecutor: DbExecutor = {
+          // biome-ignore lint/suspicious/noExplicitAny: SQL params
+          execute: async (sql: string, params: any[] = []) => {
+            await conn.run(sql, params);
+          },
+          // biome-ignore lint/suspicious/noExplicitAny: SQL results
+          query: async (sql: string, params: any[] = []) => {
+            return await conn.all(sql, params);
+          }
+        };
+
+        try {
+          await conn.run('BEGIN TRANSACTION');
+          const result = await callback(txExecutor);
+          await conn.run('COMMIT');
+          return result;
+        } catch (e) {
+          try {
+            await conn.run('ROLLBACK');
+          } catch (rollbackError) {
+            console.error('Failed to rollback transaction:', rollbackError);
+          }
+          throw e;
+        } finally {
+          // Best effort close
+          if (conn && typeof (conn as any).close === 'function') {
+            (conn as any).close();
+          }
+        }
+      }
+
+      /**
+       * Executes a query and returns the raw Apache Arrow IPC Buffer.
+       * Used for high-speed hydration.
+       */
+      // biome-ignore lint/suspicious/noExplicitAny: SQL params
+      async queryArrow(sql: string, params: any[] = []): Promise<Uint8Array> {
+        const db = this.getDb();
+        
+        return new Promise((resolve, reject) => {
+          // Hack: Access underlying node-duckdb connection/database
+          // duckdb-async instance holds 'db' property which is the native Database
+          // biome-ignore lint/suspicious/noExplicitAny: DuckDB internals
+          const rawDb = (db as any).db || db;
+
+          if (!rawDb) return reject(new Error("Could not access underlying DuckDB Native instance."));
+
+          // Helper to merge multiple Arrow batches if necessary
+          const mergeBatches = (batches: Uint8Array[]) => {
+            if (batches.length === 0) return new Uint8Array(0);
+            if (batches.length === 1) return batches[0] ?? new Uint8Array(0);
+            const totalLength = batches.reduce((acc, val) => acc + val.length, 0);
+            const merged = new Uint8Array(totalLength);
+            let offset = 0;
+            for (const batch of batches) {
+              merged.set(batch, offset);
+              offset += batch.length;
+            }
+            return merged;
+          };
+
+          // Try Database.arrowIPCAll (available in newer node-duckdb)
+          if (typeof rawDb.arrowIPCAll === 'function') {
+            // biome-ignore lint/suspicious/noExplicitAny: internal callback signature
+            rawDb.arrowIPCAll(sql, params, (err: any, result: any) => {
+              if (err) return reject(err);
+              // Result is usually Array<Uint8Array> (batches)
+              if (Array.isArray(result)) {
+                resolve(mergeBatches(result));
+              } else {
+                resolve(result ?? new Uint8Array(0));
+              }
+            });
+          } else {
+             // Fallback: Create a raw connection
+             try {
+                const rawConn = rawDb.connect();
+                
+                // Handle case where rawDb is actually the connection itself (sometimes happens in certain pool configs)
+                const target = typeof rawDb.arrowIPCAll === 'function' 
+                  ? rawDb 
+                  : (rawConn && typeof rawConn.arrowIPCAll === 'function' ? rawConn : null);
+
+                if (target) {
+                   // biome-ignore lint/suspicious/noExplicitAny: internal callback signature
+                   target.arrowIPCAll(sql, params, (err: any, result: any) => {
+                      if (err) return reject(err);
+                      if (Array.isArray(result)) {
+                        resolve(mergeBatches(result));
+                      } else {
+                        resolve(result ?? new Uint8Array(0));
+                      }
+                   });
+                } else {
+                   reject(new Error("Underlying DuckDB driver does not support arrowIPCAll"));
+                }
+             } catch(e) {
+                reject(e);
+             }
+          }
+        });
+      }
+    }
+  packages/quack-graph/src/graph.ts: |-
+    import { NativeGraph } from '@quackgraph/native';
+    import { DuckDBManager } from './db';
+    import { SchemaManager } from './schema';
+    import { QueryBuilder } from './query';
+
+    export class QuackGraph {
+      db: DuckDBManager;
+      schema: SchemaManager;
+      native: NativeGraph;
+      
+      capabilities = {
+        vss: false
+      };
+
+      // Context for the current instance (Time Travel)
+      context: {
+        asOf?: Date;
+        topologySnapshot?: string;
+      } = {};
+
+      constructor(path: string = ':memory:', options: { asOf?: Date, topologySnapshot?: string } = {}) {
+        this.db = new DuckDBManager(path);
+        this.schema = new SchemaManager(this.db);
+        this.native = new NativeGraph();
+        this.context.asOf = options.asOf;
+        this.context.topologySnapshot = options.topologySnapshot;
+      }
+
+      async init() {
+        await this.db.init();
+        
+        // Load Extensions
+        try {
+          await this.db.execute("INSTALL vss; LOAD vss;");
+          this.capabilities.vss = true;
+        } catch (e) {
+          console.warn("QuackGraph: Failed to load 'vss' extension. Vector search will be disabled.", e);
+        }
+        
+        await this.schema.ensureSchema();
+        
+        // If we are in time-travel mode, we might skip hydration or hydrate a snapshot (Advanced).
+        // For V1, we always hydrate "Current Active" topology.
+
+        // Check for Topology Snapshot
+        if (this.context.topologySnapshot) {
+          try {
+            // Try loading from disk
+            this.native.loadSnapshot(this.context.topologySnapshot);
+            // If successful, skip hydration
+            return;
+          } catch (e) {
+            console.warn(`QuackGraph: Failed to load snapshot '${this.context.topologySnapshot}'. Falling back to full hydration.`, e);
+          }
+        }
+
+        try {
+          await this.hydrate();
+        } catch (e) {
+          console.error("Failed to hydrate graph topology from disk:", e);
+          // We don't throw here to allow partial functionality (metadata queries) if needed,
+          // but usually this is fatal for graph operations.
+          throw e;
+        }
+      }
+
+      /**
+       * Hydrates the in-memory Rust graph from the persistent DuckDB storage.
+       * This is critical for the "Split-Brain" architecture.
+       */
+      async hydrate() {
+        // Zero-Copy Arrow IPC
+        // 'valid_to IS NULL' ensures we only load currently active edges.
+        try {
+          const ipcBuffer = await this.db.queryArrow(
+            "SELECT source, target, type FROM edges WHERE valid_to IS NULL"
+          );
+        
+          if (ipcBuffer && ipcBuffer.length > 0) {
+             // Napi-rs expects a Buffer or equivalent
+             // Buffer.from is zero-copy in Node for Uint8Array usually, or cheap copy
+             // We cast to any to satisfy the generated TS definitions which might expect Buffer
+             // biome-ignore lint/suspicious/noExplicitAny: Buffer cast compatibility for NAPI
+             const bufferForNapi = Buffer.isBuffer(ipcBuffer) 
+                ? ipcBuffer 
+                : Buffer.from(ipcBuffer);
+                
+             this.native.loadArrowIpc(bufferForNapi);
+
+             // Reclaim memory after burst hydration
+             this.native.compact();
+          }
+        // biome-ignore lint/suspicious/noExplicitAny: error handling
+        } catch (e: any) {
+          throw new Error(`Hydration Error: ${e.message}`);
+        }
+      }
+
+      asOf(date: Date): QuackGraph {
+        // Return a shallow copy with new context
+        const g = new QuackGraph(this.db.path, { asOf: date });
+        // Share the same DB connection and Native index (assuming topology is shared/latest)
+        g.db = this.db;
+        g.schema = this.schema;
+        g.native = this.native;
+        g.capabilities = { ...this.capabilities };
+        return g;
+      }
+
+      // --- Write Operations (Write-Through) ---
+
+      // biome-ignore lint/suspicious/noExplicitAny: generic properties
+      async addNode(id: string, labels: string[], props: Record<string, any> = {}) {
+        // 1. Write to Disk (Source of Truth)
+        await this.schema.writeNode(id, labels, props);
+        // 2. Write to RAM (Cache)
+        this.native.addNode(id);
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: generic properties
+      async addEdge(source: string, target: string, type: string, props: Record<string, any> = {}) {
+        // 1. Write to Disk
+        await this.schema.writeEdge(source, target, type, props);
+        // 2. Write to RAM
+        this.native.addEdge(source, target, type);
+      }
+
+      async deleteNode(id: string) {
+        // 1. Write to Disk (Soft Delete)
+        await this.schema.deleteNode(id);
+        // 2. Write to RAM (Tombstone)
+        this.native.removeNode(id);
+      }
+
+      async deleteEdge(source: string, target: string, type: string) {
+        // 1. Write to Disk (Soft Delete)
+        await this.schema.deleteEdge(source, target, type);
+        // 2. Write to RAM (Remove)
+        this.native.removeEdge(source, target, type);
+      }
+
+      // --- Optimization & Maintenance ---
+
+      get optimize() {
+        return {
+          promoteProperty: async (label: string, property: string, type: string) => {
+            await this.schema.promoteNodeProperty(label, property, type);
+          },
+          saveTopologySnapshot: (path: string) => {
+            this.native.saveSnapshot(path);
+          }
+        };
+      }
+
+      // --- Read Operations ---
+
+      match(labels: string[]): QueryBuilder {
+        return new QueryBuilder(this, labels);
+      }
+    }
+  packages/quack-graph/src/query.ts: |-
+    import { QuackGraph } from './graph';
+
+    type TraversalStep = {
+      type: 'out' | 'in';
+      edge: string;
+    };
+
+    export class QueryBuilder {
+      private graph: QuackGraph;
+      private startLabels: string[];
+      private endLabels: string[] = [];
+
+      // Bottom Bun Filters (Initial selection)
+      private initialFilters: Record<string, any> = {};
+      private vectorSearch: { vector: number[]; limit: number } | null = null;
+
+      // The Meat (Traversal)
+      private traversals: TraversalStep[] = [];
+
+      // Top Bun Filters (Final selection)
+      private terminalFilters: Record<string, any> = {};
+
+      constructor(graph: QuackGraph, labels: string[]) {
+        this.graph = graph;
+        this.startLabels = labels;
+      }
+
+      /**
+       * Filter nodes by properties.
+       * If called before traversal, applies to Start Nodes.
+       * If called after traversal, applies to End Nodes.
+       */
+      where(criteria: Record<string, any>): this {
+        if (this.traversals.length === 0) {
+          this.initialFilters = { ...this.initialFilters, ...criteria };
+        } else {
+          this.terminalFilters = { ...this.terminalFilters, ...criteria };
+        }
+        return this;
+      }
+
+      /**
+       * Perform a Vector Similarity Search (HNSW).
+       * This effectively sorts the start nodes by distance to the query vector.
+       */
+      nearText(vector: number[], options: { limit?: number } = {}): this {
+        this.vectorSearch = { 
+          vector, 
+          limit: options.limit || 10 
+        };
+        return this;
+      }
+
+      out(edgeType: string): this {
+        this.traversals.push({ type: 'out', edge: edgeType });
+        return this;
+      }
+
+      /**
+       * Filter the nodes at the end of the traversal by label.
+       */
+      node(labels: string[]): this {
+        this.endLabels = labels;
+        return this;
+      }
+
+      /**
+       * Helper to construct the temporal validity clause
+       */
+      private getTemporalClause(tableAlias: string = ''): string {
+        const prefix = tableAlias ? `${tableAlias}.` : '';
+        if (this.graph.context.asOf) {
+          // Time Travel: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+          // Interpolate strict ISO string
+          const iso = this.graph.context.asOf.toISOString();
+          // DuckDB TIMESTAMP comparison works with ISO strings
+          return `(${prefix}valid_from <= '${iso}' AND (${prefix}valid_to > '${iso}' OR ${prefix}valid_to IS NULL))`;
+        }
+        // Default: Current valid records (valid_to is NULL)
+        return `${prefix}valid_to IS NULL`;
+      }
+
+      async select<T = any>(mapper?: (node: any) => T): Promise<T[]> {
+        // --- Step 1: DuckDB Filter (Bottom Bun) ---
+        // Objective: Get a list of "Active" Node IDs to feed into the graph.
+
+        let query = `SELECT id FROM nodes`;
+        const params: any[] = [];
+        const conditions: string[] = [];
+
+        // 1.a Temporal Filter
+        conditions.push(this.getTemporalClause());
+
+        // 1.b Label Filter
+        if (this.startLabels.length > 0) {
+          // Check if ANY of the labels match. For V1 we check the first one or intersection.
+          conditions.push(`list_contains(labels, ?)`);
+          params.push(this.startLabels[0]);
+        }
+
+        // 1.c Property Filter
+        for (const [key, value] of Object.entries(this.initialFilters)) {
+          conditions.push(`json_extract(properties, '$.${key}') = ?`);
+          params.push(value);
+        }
+
+        // 1.d Vector Search (Order By Distance)
+        let orderBy = '';
+        let limit = '';
+        if (this.vectorSearch) {
+          if (!this.graph.capabilities.vss) {
+            throw new Error("Vector Search (nearText) requires the 'vss' DuckDB extension, which failed to load.");
+          }
+          // Requires: array_distance(embedding, [1,2,3])
+          // DuckDB VSS extension syntax
+          const vectorStr = `[${this.vectorSearch.vector.join(',')}]`; // Inline vector for V1
+          orderBy = `ORDER BY array_distance(embedding, ${vectorStr}::FLOAT[${this.vectorSearch.vector.length}])`;
+          limit = `LIMIT ${this.vectorSearch.limit}`;
+        }
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` ${orderBy} ${limit}`;
+
+        const startRows = await this.graph.db.query(query, params);
+        let currentIds: string[] = startRows.map(row => row.id);
+
+        if (currentIds.length === 0) return [];
+
+        // --- Step 2: Rust Traversal (The Meat) ---
+        // Note: Rust Graph Index is currently "Latest Topology Only". 
+        // Time Travel on topology requires checking edge validity during traversal (V2).
+        // For V1, we accept that traversal is instant/current, but properties are historical.
+
+        for (const step of this.traversals) {
+          if (currentIds.length === 0) break;
+          // step.type is 'out' | 'in'
+          // native.traverse(ids, edgeType, direction)
+          currentIds = this.graph.native.traverse(currentIds, step.edge, step.type);
+        }
+
+        // Optimization: If traversal resulted in no nodes, stop early.
+        if (currentIds.length === 0) return [];
+
+        // --- Step 3: DuckDB Hydration (Top Bun) ---
+        // Objective: Fetch full properties for the resulting IDs, applying terminal filters.
+
+        const finalConditions: string[] = [];
+        const finalParams: any[] = [];
+
+        // 3.0 Label Filter (for End Nodes)
+        if (this.endLabels.length > 0) {
+          finalConditions.push(`list_contains(labels, ?)`);
+          finalParams.push(this.endLabels[0]);
+        }
+
+        // 3.a IDs match
+        // We can't use parameters for IN clause effectively with dynamic length in all drivers.
+        // Constructing placeholders.
+        const placeholders = currentIds.map(() => '?').join(',');
+        finalConditions.push(`id IN (${placeholders})`);
+        finalParams.push(...currentIds);
+
+        // 3.b Temporal Validity
+        finalConditions.push(this.getTemporalClause());
+
+        // 3.c Terminal Property Filters
+        for (const [key, value] of Object.entries(this.terminalFilters)) {
+          finalConditions.push(`json_extract(properties, '$.${key}') = ?`);
+          finalParams.push(value);
+        }
+
+        const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join(' AND ')}`;
+        const results = await this.graph.db.query(finalSql, finalParams);
+
+        return results.map(r => {
+          let props = r.properties;
+          if (typeof props === 'string') {
+            try { props = JSON.parse(props); } catch {}
+          }
+          const node = {
+            id: r.id,
+            labels: r.labels,
+            ...props
+          };
+          return mapper ? mapper(node) : node;
+        });
+      }
+    }
+approved: true
+linesAdded: 19
+linesRemoved: 5
+linesDifference: 24
+gitCommittedAt: '2025-12-02T10:40:48.526Z'
+status: committed
+id: 22

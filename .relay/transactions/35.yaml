@@ -1,0 +1,665 @@
+uuid: 13a48439-e93d-4c7b-9c2d-9471ac3b89fa
+projectId: quackgraph
+createdAt: '2025-12-02T12:26:40.653Z'
+gitCommitMsg: >-
+  fix: handle ID filtering and temporal type consistency
+
+  - Changed schema to use TIMESTAMPTZ to fix timezone mismatches in temporal
+  tests. - Updated QueryBuilder to correctly filter by 'id' column instead of
+  looking in JSON properties. - Fixed lint issues in tests.
+promptSummary: Fix failing E2E tests (ID filtering, Temporal types) and lint issues.
+reasoning:
+  - Here are the changes to fix the failing tests and lint issues.
+  - '### 1. Fix Schema Timezone Issues (`packages/quack-graph/src/schema.ts`)'
+  - >-
+    The `valid_from` and `valid_to` columns were defined as `TIMESTAMP` (naive),
+    but DuckDB's `current_timestamp` returns a `TIMESTAMP WITH TIME ZONE`. This
+    caused mismatches when comparing against JavaScript's `Date.toISOString()`
+    (UTC) in tests, especially in environments where Local Time != UTC.
+    Switching to `TIMESTAMPTZ` ensures consistent time comparisons.
+  - '### 2. Fix Query Filtering for `id` (`packages/quack-graph/src/query.ts`)'
+  - >-
+    The `QueryBuilder` blindly assumed all filters targeted the JSON
+    `properties` blob. However, `id` is a top-level column in the DuckDB schema.
+    This caused `where({ id: 'foo' })` to fail because `json_extract(properties,
+    '$.id')` returns NULL (id is not inside properties). I've added a check to
+    handle `id` specifically.
+  - '### 3. Fix Lint Issue in `test/integration/persistence.test.ts`'
+  - Using template literals instead of string concatenation.
+  - '### 4. Fix Lint Issue in `test/integration/temporal.test.ts`'
+  - Marking unused variable `t2` with an underscore.
+operations:
+  - type: write
+    path: packages/quack-graph/src/schema.ts
+    content: |
+      --- packages/quack-graph/src/schema.ts
+      +++ packages/quack-graph/src/schema.ts
+      @@ -8,6 +8,6 @@
+           properties JSON,
+           embedding FLOAT[], -- Vector embedding
+      -    valid_from TIMESTAMP DEFAULT current_timestamp,
+      -    valid_to TIMESTAMP DEFAULT NULL
+      +    valid_from TIMESTAMPTZ DEFAULT current_timestamp,
+      +    valid_to TIMESTAMPTZ DEFAULT NULL
+       );
+       CREATE SEQUENCE IF NOT EXISTS seq_node_id;
+      @@ -19,6 +19,6 @@
+           type TEXT NOT NULL,
+           properties JSON,
+      -    valid_from TIMESTAMP DEFAULT current_timestamp,
+      -    valid_to TIMESTAMP DEFAULT NULL
+      +    valid_from TIMESTAMPTZ DEFAULT current_timestamp,
+      +    valid_to TIMESTAMPTZ DEFAULT NULL
+       );
+       `;
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/query.ts
+    content: >
+      --- packages/quack-graph/src/query.ts
+
+      +++ packages/quack-graph/src/query.ts
+
+      @@ -112,6 +112,9 @@
+           // 1.c Property Filter
+           for (const [key, value] of Object.entries(this.initialFilters)) {
+      -      conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+
+      -      params.push(JSON.stringify(value));
+
+      +      if (key === 'id') {
+
+      +        conditions.push(`id = ?`);
+
+      +        params.push(value);
+
+      +      } else {
+
+      +        conditions.push(`json_extract(properties, '$.${key}') =
+      ?::JSON`);
+
+      +        params.push(JSON.stringify(value));
+
+      +      }
+           }
+       
+      @@ -176,6 +179,9 @@
+           // 3.c Terminal Property Filters
+           for (const [key, value] of Object.entries(this.terminalFilters)) {
+      -      finalConditions.push(`json_extract(properties, '$.${key}') =
+      ?::JSON`);
+
+      -      finalParams.push(JSON.stringify(value));
+
+      +      if (key === 'id') {
+
+      +        finalConditions.push(`id = ?`);
+
+      +        finalParams.push(value);
+
+      +      } else {
+
+      +        finalConditions.push(`json_extract(properties, '$.${key}') =
+      ?::JSON`);
+
+      +        finalParams.push(JSON.stringify(value));
+
+      +      }
+           }
+    patchStrategy: standard-diff
+  - type: write
+    path: test/integration/persistence.test.ts
+    content: |
+      --- test/integration/persistence.test.ts
+      +++ test/integration/persistence.test.ts
+      @@ -74,5 +74,5 @@
+           const g1 = setup.graph;
+           paths.push(setup.path);
+      -    const snapshotPath = setup.path + '.bin';
+      +    const snapshotPath = `${setup.path}.bin`;
+           paths.push(snapshotPath); // Cleanup this too
+    patchStrategy: standard-diff
+  - type: write
+    path: test/integration/temporal.test.ts
+    content: |
+      --- test/integration/temporal.test.ts
+      +++ test/integration/temporal.test.ts
+      @@ -28,5 +28,5 @@
+           // T2: Update again
+           await g.addNode('u1', ['User'], { status: 'banned' });
+      -    const t2 = new Date();
+      +    const _t2 = new Date();
+       
+           // Query Current (T2)
+    patchStrategy: standard-diff
+snapshot:
+  packages/quack-graph/src/schema.ts: |-
+    import type { DuckDBManager, DbExecutor } from './db';
+
+    const NODES_TABLE = `
+    CREATE TABLE IF NOT EXISTS nodes (
+        row_id UBIGINT PRIMARY KEY, -- Simple auto-increment equivalent logic handled by sequence
+        id TEXT NOT NULL,
+        labels TEXT[],
+        properties JSON,
+        embedding FLOAT[], -- Vector embedding
+        valid_from TIMESTAMP DEFAULT current_timestamp,
+        valid_to TIMESTAMP DEFAULT NULL
+    );
+    CREATE SEQUENCE IF NOT EXISTS seq_node_id;
+    `;
+
+    const EDGES_TABLE = `
+    CREATE TABLE IF NOT EXISTS edges (
+        source TEXT NOT NULL,
+        target TEXT NOT NULL,
+        type TEXT NOT NULL,
+        properties JSON,
+        valid_from TIMESTAMP DEFAULT current_timestamp,
+        valid_to TIMESTAMP DEFAULT NULL
+    );
+    `;
+
+    export class SchemaManager {
+      constructor(private db: DuckDBManager) {}
+
+      async ensureSchema() {
+        await this.db.execute(NODES_TABLE);
+        await this.db.execute(EDGES_TABLE);
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: generic properties
+      async writeNode(id: string, labels: string[], properties: Record<string, any> = {}) {
+        await this.db.transaction(async (tx: DbExecutor) => {
+          // 1. Close existing record (SCD Type 2)
+          await tx.execute(
+            `UPDATE nodes SET valid_to = current_timestamp WHERE id = ? AND valid_to IS NULL`,
+            [id]
+          );
+          // 2. Insert new version
+          await tx.execute(`
+            INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
+            VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, current_timestamp, NULL)
+          `, [id, JSON.stringify(labels), JSON.stringify(properties)]);
+        });
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: generic properties
+      async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}) {
+        await this.db.transaction(async (tx: DbExecutor) => {
+          // 1. Close existing edge
+          await tx.execute(
+            `UPDATE edges SET valid_to = current_timestamp WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+            [source, target, type]
+          );
+          // 2. Insert new version
+          await tx.execute(`
+            INSERT INTO edges (source, target, type, properties, valid_from, valid_to) 
+            VALUES (?, ?, ?, ?::JSON, current_timestamp, NULL)
+          `, [source, target, type, JSON.stringify(properties)]);
+        });
+      }
+
+      async deleteNode(id: string) {
+        // Soft Delete: Close the validity period
+        await this.db.transaction(async (tx: DbExecutor) => {
+          await tx.execute(
+            `UPDATE nodes SET valid_to = current_timestamp WHERE id = ? AND valid_to IS NULL`,
+            [id]
+          );
+        });
+      }
+
+      async deleteEdge(source: string, target: string, type: string) {
+        // Soft Delete: Close the validity period
+        await this.db.transaction(async (tx: DbExecutor) => {
+          await tx.execute(
+            `UPDATE edges SET valid_to = current_timestamp WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+            [source, target, type]
+          );
+        });
+      }
+
+      /**
+       * Promotes a JSON property to a native column for faster filtering.
+       * This creates a column on the `nodes` table and backfills it from the `properties` JSON blob.
+       * 
+       * @param label The node label to target (e.g., 'User'). Only nodes with this label will be updated.
+       * @param property The property key to promote (e.g., 'age').
+       * @param type The DuckDB SQL type (e.g., 'INTEGER', 'VARCHAR').
+       */
+      async promoteNodeProperty(label: string, property: string, type: string) {
+        // Sanitize inputs to prevent basic SQL injection (rudimentary check)
+        if (!/^[a-zA-Z0-9_]+$/.test(property)) throw new Error(`Invalid property name: '${property}'. Must be alphanumeric + underscore.`);
+        // Type check is looser to allow various SQL types, but strictly alphanumeric + spaces/parens usually safe enough for now
+        if (!/^[a-zA-Z0-9_() ]+$/.test(type)) throw new Error(`Invalid SQL type: '${type}'.`);
+        // Sanitize label just in case, though it is used as a parameter usually, here we might need dynamic check if we were using it in table names, but we use it in list_contains param.
+        
+        // 1. Add Column (Idempotent)
+        try {
+          // Note: DuckDB 0.9+ supports ADD COLUMN IF NOT EXISTS
+          await this.db.execute(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ${property} ${type}`);
+        } catch (_e) {
+          // Fallback or ignore if column exists
+        }
+
+        // 2. Backfill Data
+        // We use list_contains to only update relevant nodes
+        const sql = `
+          UPDATE nodes 
+          SET ${property} = CAST(json_extract(properties, '$.${property}') AS ${type})
+          WHERE list_contains(labels, ?)
+        `;
+        await this.db.execute(sql, [label]);
+      }
+    }
+  test/integration/persistence.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph } from '../utils/helpers';
+    import { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('Integration: Persistence & Hydration', () => {
+      // Keep track of paths to clean up
+      const paths: string[] = [];
+
+      afterEach(async () => {
+        for (const p of paths) {
+          await cleanupGraph(p);
+        }
+        paths.length = 0; // Clear
+      });
+
+      test('should hydrate Rust topology from Disk on startup', async () => {
+        // 1. Setup Graph A (Disk)
+        const setup = await createGraph('disk', 'persist-hydrate');
+        const g1 = setup.graph;
+        const path = setup.path;
+        paths.push(path);
+
+        // 2. Add Data to Graph A
+        await g1.addNode('root', ['Root']);
+        await g1.addNode('child1', ['Leaf']);
+        await g1.addNode('child2', ['Leaf']);
+        await g1.addEdge('root', 'child1', 'PARENT_OF');
+        await g1.addEdge('root', 'child2', 'PARENT_OF');
+
+        expect(g1.native.nodeCount).toBe(3);
+        expect(g1.native.edgeCount).toBe(2);
+
+        // 3. Initialize Graph B on the same file (Simulates Restart)
+        const g2 = new QuackGraph(path);
+        await g2.init(); // Triggers hydrate() from Arrow IPC
+
+        // 4. Verify Graph B State
+        expect(g2.native.nodeCount).toBe(3);
+        expect(g2.native.edgeCount).toBe(2);
+
+        const children = g2.native.traverse(['root'], 'PARENT_OF', 'out');
+        expect(children.length).toBe(2);
+        expect(children.sort()).toEqual(['child1', 'child2']);
+      });
+
+      test('should respect soft deletes during hydration', async () => {
+        const setup = await createGraph('disk', 'persist-soft-del');
+        const g1 = setup.graph;
+        paths.push(setup.path);
+
+        await g1.addNode('a', ['A']);
+        await g1.addNode('b', ['B']);
+        await g1.addEdge('a', 'b', 'KNOWS');
+
+        // Soft Delete
+        await g1.deleteEdge('a', 'b', 'KNOWS');
+        
+        // Verify immediate effect in Memory
+        expect(g1.native.traverse(['a'], 'KNOWS', 'out')).toEqual([]);
+
+        // Restart / Hydrate
+        const g2 = new QuackGraph(setup.path);
+        await g2.init();
+
+        // Verify Deleted Edge is NOT hydrated
+        // The query `SELECT ... WHERE valid_to IS NULL` should exclude it
+        expect(g2.native.edgeCount).toBe(0);
+        const neighbors = g2.native.traverse(['a'], 'KNOWS', 'out');
+        expect(neighbors).toEqual([]);
+      });
+
+      test('Snapshot: should save and load binary topology', async () => {
+        const setup = await createGraph('disk', 'persist-snapshot');
+        const g1 = setup.graph;
+        paths.push(setup.path);
+        const snapshotPath = setup.path + '.bin';
+        paths.push(snapshotPath); // Cleanup this too
+
+        // Populate
+        await g1.addNode('x', ['X']);
+        await g1.addNode('y', ['Y']);
+        await g1.addEdge('x', 'y', 'LINK');
+
+        // Save Snapshot
+        g1.optimize.saveTopologySnapshot(snapshotPath);
+
+        // Load New Graph using Snapshot (skipping DB hydration)
+        const g2 = new QuackGraph(setup.path, { topologySnapshot: snapshotPath });
+        await g2.init();
+
+        expect(g2.native.nodeCount).toBe(2);
+        expect(g2.native.edgeCount).toBe(1);
+        expect(g2.native.traverse(['x'], 'LINK', 'out')).toEqual(['y']);
+      });
+
+      test('Special Characters: should handle emojis and spaces in IDs', async () => {
+        const setup = await createGraph('disk', 'persist-special');
+        const g1 = setup.graph;
+        paths.push(setup.path);
+
+        const id1 = 'User A (Admin)';
+        const id2 = 'User B 🦆';
+
+        await g1.addNode(id1, ['User']);
+        await g1.addNode(id2, ['User']);
+        await g1.addEdge(id1, id2, 'EMOJI_LINK 🔗');
+
+        // Restart
+        const g2 = new QuackGraph(setup.path);
+        await g2.init();
+
+        const result = g2.native.traverse([id1], 'EMOJI_LINK 🔗', 'out');
+        expect(result).toEqual([id2]);
+        
+        // Reverse
+        const reverse = g2.native.traverse([id2], 'EMOJI_LINK 🔗', 'in');
+        expect(reverse).toEqual([id1]);
+      });
+    });
+  packages/quack-graph/src/query.ts: |-
+    import type { QuackGraph } from './graph';
+
+    type TraversalStep = {
+      type: 'out' | 'in';
+      edge: string;
+    };
+
+    export class QueryBuilder {
+      private graph: QuackGraph;
+      private startLabels: string[];
+      private endLabels: string[] = [];
+
+      // Bottom Bun Filters (Initial selection)
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      private initialFilters: Record<string, any> = {};
+      private vectorSearch: { vector: number[]; limit: number } | null = null;
+
+      // The Meat (Traversal)
+      private traversals: TraversalStep[] = [];
+
+      // Top Bun Filters (Final selection)
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      private terminalFilters: Record<string, any> = {};
+
+      constructor(graph: QuackGraph, labels: string[]) {
+        this.graph = graph;
+        this.startLabels = labels;
+      }
+
+      /**
+       * Filter nodes by properties.
+       * If called before traversal, applies to Start Nodes.
+       * If called after traversal, applies to End Nodes.
+       */
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      where(criteria: Record<string, any>): this {
+        if (this.traversals.length === 0) {
+          this.initialFilters = { ...this.initialFilters, ...criteria };
+        } else {
+          this.terminalFilters = { ...this.terminalFilters, ...criteria };
+        }
+        return this;
+      }
+
+      /**
+       * Perform a Vector Similarity Search (HNSW).
+       * This effectively sorts the start nodes by distance to the query vector.
+       */
+      nearText(vector: number[], options: { limit?: number } = {}): this {
+        this.vectorSearch = { 
+          vector, 
+          limit: options.limit || 10 
+        };
+        return this;
+      }
+
+      out(edgeType: string): this {
+        this.traversals.push({ type: 'out', edge: edgeType });
+        return this;
+      }
+
+      in(edgeType: string): this {
+        this.traversals.push({ type: 'in', edge: edgeType });
+        return this;
+      }
+
+      /**
+       * Filter the nodes at the end of the traversal by label.
+       */
+      node(labels: string[]): this {
+        this.endLabels = labels;
+        return this;
+      }
+
+      /**
+       * Helper to construct the temporal validity clause
+       */
+      private getTemporalClause(tableAlias: string = ''): string {
+        const prefix = tableAlias ? `${tableAlias}.` : '';
+        if (this.graph.context.asOf) {
+          // Time Travel: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+          // Interpolate strict ISO string
+          const iso = this.graph.context.asOf.toISOString();
+          // DuckDB TIMESTAMP comparison works with ISO strings
+          return `(${prefix}valid_from <= '${iso}' AND (${prefix}valid_to > '${iso}' OR ${prefix}valid_to IS NULL))`;
+        }
+        // Default: Current valid records (valid_to is NULL)
+        return `${prefix}valid_to IS NULL`;
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: Generic result mapper
+      async select<T = any>(mapper?: (node: any) => T): Promise<T[]> {
+        // --- Step 1: DuckDB Filter (Bottom Bun) ---
+        // Objective: Get a list of "Active" Node IDs to feed into the graph.
+
+        let query = `SELECT id FROM nodes`;
+        // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+        const params: any[] = [];
+        const conditions: string[] = [];
+
+        // 1.a Temporal Filter
+        conditions.push(this.getTemporalClause());
+
+        // 1.b Label Filter
+        if (this.startLabels.length > 0) {
+          // Check if ANY of the labels match. For V1 we check the first one or intersection.
+          conditions.push(`list_contains(labels, ?)`);
+          params.push(this.startLabels[0]);
+        }
+
+        // 1.c Property Filter
+        for (const [key, value] of Object.entries(this.initialFilters)) {
+          conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+          params.push(JSON.stringify(value));
+        }
+
+        // 1.d Vector Search (Order By Distance)
+        let orderBy = '';
+        let limit = '';
+        if (this.vectorSearch) {
+          if (!this.graph.capabilities.vss) {
+            throw new Error("Vector Search (nearText) requires the 'vss' DuckDB extension, which failed to load.");
+          }
+          // Requires: array_distance(embedding, [1,2,3])
+          // DuckDB VSS extension syntax
+          const vectorStr = `[${this.vectorSearch.vector.join(',')}]`; // Inline vector for V1
+          orderBy = `ORDER BY array_distance(embedding, ${vectorStr}::FLOAT[${this.vectorSearch.vector.length}])`;
+          limit = `LIMIT ${this.vectorSearch.limit}`;
+        }
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` ${orderBy} ${limit}`;
+
+        const startRows = await this.graph.db.query(query, params);
+        let currentIds: string[] = startRows.map(row => row.id);
+
+        if (currentIds.length === 0) return [];
+
+        // --- Step 2: Rust Traversal (The Meat) ---
+        // Note: Rust Graph Index is currently "Latest Topology Only". 
+        // Time Travel on topology requires checking edge validity during traversal (V2).
+        // For V1, we accept that traversal is instant/current, but properties are historical.
+
+        for (const step of this.traversals) {
+          if (currentIds.length === 0) break;
+          // step.type is 'out' | 'in'
+          // native.traverse(ids, edgeType, direction)
+          currentIds = this.graph.native.traverse(currentIds, step.edge, step.type);
+        }
+
+        // Optimization: If traversal resulted in no nodes, stop early.
+        if (currentIds.length === 0) return [];
+
+        // --- Step 3: DuckDB Hydration (Top Bun) ---
+        // Objective: Fetch full properties for the resulting IDs, applying terminal filters.
+
+        const finalConditions: string[] = [];
+        // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+        const finalParams: any[] = [];
+
+        // 3.0 Label Filter (for End Nodes)
+        if (this.endLabels.length > 0) {
+          finalConditions.push(`list_contains(labels, ?)`);
+          finalParams.push(this.endLabels[0]);
+        }
+
+        // 3.a IDs match
+        // We can't use parameters for IN clause effectively with dynamic length in all drivers.
+        // Constructing placeholders.
+        const placeholders = currentIds.map(() => '?').join(',');
+        finalConditions.push(`id IN (${placeholders})`);
+        finalParams.push(...currentIds);
+
+        // 3.b Temporal Validity
+        finalConditions.push(this.getTemporalClause());
+
+        // 3.c Terminal Property Filters
+        for (const [key, value] of Object.entries(this.terminalFilters)) {
+          finalConditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+          finalParams.push(JSON.stringify(value));
+        }
+
+        const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join(' AND ')}`;
+        const results = await this.graph.db.query(finalSql, finalParams);
+
+        return results.map(r => {
+          let props = r.properties;
+          if (typeof props === 'string') {
+            try { props = JSON.parse(props); } catch {}
+          }
+          const node = {
+            id: r.id,
+            labels: r.labels,
+            ...props
+          };
+          return mapper ? mapper(node) : node;
+        });
+      }
+    }
+  test/integration/temporal.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph, sleep } from '../utils/helpers';
+    import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('Integration: Temporal Time-Travel', () => {
+      let g: QuackGraph;
+      let path: string;
+
+      afterEach(async () => {
+        if (path) await cleanupGraph(path);
+      });
+
+      test('should retrieve historical property values using asOf', async () => {
+        const setup = await createGraph('disk', 'temporal-props');
+        g = setup.graph;
+        path = setup.path;
+
+        // T0: Create
+        await g.addNode('u1', ['User'], { status: 'active' });
+        const t0 = new Date();
+        await sleep(100); // Ensure clock tick
+
+        // T1: Update
+        await g.addNode('u1', ['User'], { status: 'suspended' });
+        const t1 = new Date();
+        await sleep(100);
+
+        // T2: Update again
+        await g.addNode('u1', ['User'], { status: 'banned' });
+        const t2 = new Date();
+
+        // Query Current (T2)
+        const current = await g.match(['User']).where({}).select();
+        expect(current[0].status).toBe('banned');
+
+        // Query T0 (Should see 'active')
+        // Note: strict equality might be tricky with microsecond precision,
+        // so we pass a time slightly after T0 or exactly T0.
+        // The query logic is: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+        // At T0: valid_from=T0, valid_to=T1.
+        // Query at T0: T0 <= T0 (True) AND T1 > T0 (True).
+        const q0 = await g.asOf(t0).match(['User']).where({}).select();
+        expect(q0[0].status).toBe('active');
+
+        // Query T1 (Should see 'suspended')
+        const q1 = await g.asOf(t1).match(['User']).where({}).select();
+        expect(q1[0].status).toBe('suspended');
+      });
+
+      test('should handle node lifecycle (create -> delete)', async () => {
+        const setup = await createGraph('disk', 'temporal-lifecycle');
+        g = setup.graph;
+        path = setup.path;
+
+        // T0: Empty
+        const t0 = new Date();
+        await sleep(50);
+
+        // T1: Alive
+        await g.addNode('temp', ['Temp']);
+        const t1 = new Date();
+        await sleep(50);
+
+        // T2: Deleted
+        await g.deleteNode('temp');
+        const t2 = new Date();
+
+        // Verify
+        const resT0 = await g.asOf(t0).match(['Temp']).select();
+        expect(resT0.length).toBe(0);
+
+        const resT1 = await g.asOf(t1).match(['Temp']).select();
+        expect(resT1.length).toBe(1);
+        expect(resT1[0].id).toBe('temp');
+
+        const resT2 = await g.asOf(t2).match(['Temp']).select();
+        expect(resT2.length).toBe(0);
+      });
+    });
+approved: true
+linesAdded: 20
+linesRemoved: 10
+linesDifference: 30
+gitCommittedAt: null
+status: committed
+id: 35

@@ -1,0 +1,1347 @@
+uuid: 8b1f2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
+projectId: quackgraph
+createdAt: '2025-12-02T12:43:03.712Z'
+gitCommitMsg: >-
+  test: Add Integration & E2E Test Suite
+
+  - Added integration tests for complex queries, error cases, and temporal
+  logic. - Added E2E domain tests: RBAC, Fraud Detection, Recommendation, Social
+  Network, Supply Chain. - Verified Schema Promotion optimization.
+promptSummary: >-
+  Executed Part 3 (Query/Temporal Integration) and Part 4 (E2E Domains).
+  Implemented comprehensive tests for "Sandwich" queries, error handling,
+  time-travel,  and real-world scenarios (RBAC, Fraud, Social, Supply Chain).
+reasoning:
+  - >-
+    Part 3 and Part 4 of the plan focus on the Query Engine, Temporal Logic, and
+    real-world E2E scenarios. I will implement the remaining integration tests
+    and the full suite of E2E domain tests.
+  - '### Steps Taken'
+  - >-
+    1.  **Implement `test/integration/complex-query.test.ts`**: Verifies the
+    core "Sandwich" execution model (DuckDB Filter -> Rust Traversal -> DuckDB
+    Filter).
+  - >-
+    2.  **Implement `test/integration/errors.test.ts`**: covers edge cases like
+    phantom nodes (topology exists but data doesn't) and special characters in
+    the Query Builder.
+  - >-
+    3.  **Implement `test/integration/temporal.test.ts`**: Verifies time-travel
+    functionality using `asOf()`.
+  - '4.  **Implement E2E Suites**:'
+  - '-   `access-control.test.ts`: Recursive RBAC.'
+  - '-   `fraud.test.ts`: Cycle detection and shared resource linkage.'
+  - '-   `recommendation.test.ts`: "Users who bought X also bought Y".'
+  - >-
+    -   `social.test.ts`: Friends of friends and Schema Optimization (Property
+    Promotion).
+  - '-   `supply-chain.test.ts`: Deep impact analysis.'
+operations:
+  - type: write
+    path: test/integration/complex-query.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('Integration: Complex Query Logic', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should support the "Sandwich" pattern: Filter -> Traverse -> Filter', async () => {
+          const setup = await createGraph('disk', 'int-complex-query');
+          g = setup.graph;
+          path = setup.path;
+
+          // Graph:
+          // User(Active) -> KNOWS -> User(Active, Age 20)
+          // User(Active) -> KNOWS -> User(Inactive, Age 20)
+          // User(Active) -> KNOWS -> User(Active, Age 50)
+
+          await g.addNode('start', ['User'], { status: 'active' });
+          
+          await g.addNode('u1', ['User'], { status: 'active', age: 20 });
+          await g.addNode('u2', ['User'], { status: 'inactive', age: 20 });
+          await g.addNode('u3', ['User'], { status: 'active', age: 50 });
+
+          await g.addEdge('start', 'u1', 'KNOWS');
+          await g.addEdge('start', 'u2', 'KNOWS');
+          await g.addEdge('start', 'u3', 'KNOWS');
+
+          // Query: Start node (status=active) -> KNOWS -> End node (status=active AND age=20)
+          const results = await g.match(['User'])
+              .where({ id: 'start', status: 'active' }) // Initial Filter
+              .out('KNOWS')                             // Traversal
+              .node(['User'])
+              .where({ status: 'active', age: 20 })     // Terminal Filter
+              .select(u => u.id);
+
+          expect(results.length).toBe(1);
+          expect(results[0]).toBe('u1');
+        });
+
+        test('should handle empty intermediate results gracefully', async () => {
+          const setup = await createGraph('disk', 'int-empty-query');
+          g = setup.graph;
+          path = setup.path;
+
+          await g.addNode('a', ['Node']);
+          
+          const results = await g.match(['Node'])
+              .where({ id: 'a' })
+              .out('MISSING_EDGE')
+              .out('ANOTHER_EDGE')
+              .select(n => n.id);
+
+          expect(results).toEqual([]);
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/integration/errors.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('Integration: Error Handling & Edge Cases', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should allow edges to non-existent nodes (Graph Pattern Matching behavior)', async () => {
+          // QuackGraph V1 is schemaless. It allows adding edges to nodes that haven't been explicitly created.
+          // However, since those nodes don't exist in the 'nodes' table, they should be filtered out 
+          // during the final hydration (SELECT * FROM nodes) step of the query builder.
+          
+          const setup = await createGraph('disk', 'int-errors');
+          g = setup.graph;
+          path = setup.path;
+
+          await g.addNode('real_node', ['Node']);
+          // Edge to phantom node
+          await g.addEdge('real_node', 'phantom_node', 'LINK');
+
+          // 1. Native Traversal should find it (Topology exists)
+          const nativeNeighbors = g.native.traverse(['real_node'], 'LINK', 'out');
+          expect(nativeNeighbors).toContain('phantom_node');
+
+          // 2. Query Builder should NOT return it (Data missing)
+          const neighbors = await g.match(['Node'])
+              .where({ id: 'real_node' })
+              .out('LINK')
+              .select(n => n.id);
+
+          expect(neighbors.length).toBe(0); 
+        });
+
+        test('should handle special characters in IDs', async () => {
+          const setup = await createGraph('disk', 'int-special-chars');
+          g = setup.graph;
+          path = setup.path;
+
+          const crazyId = 'Node/With"Quotes\'And\\Backslashes 🦆';
+          await g.addNode(crazyId, ['Node']);
+          await g.addNode('b', ['Node']);
+          await g.addEdge(crazyId, 'b', 'LINK');
+
+          const result = await g.match(['Node'])
+              .where({ id: crazyId })
+              .out('LINK')
+              .select(n => n.id);
+              
+          expect(result).toEqual(['b']);
+          
+          // Reverse check
+          const reverse = await g.match(['Node'])
+              .where({ id: 'b' })
+              .in('LINK')
+              .select(n => n.id);
+          
+          expect(reverse).toEqual([crazyId]);
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/integration/temporal.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph, sleep } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('Integration: Temporal Time-Travel', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should retrieve historical property values using asOf', async () => {
+          const setup = await createGraph('disk', 'temporal-props');
+          g = setup.graph;
+          path = setup.path;
+
+          // T0: Create
+          await g.addNode('u1', ['User'], { status: 'active' });
+          const t0 = new Date();
+          await sleep(100); // Ensure clock tick
+
+          // T1: Update
+          await g.addNode('u1', ['User'], { status: 'suspended' });
+          const t1 = new Date();
+          await sleep(100);
+
+          // T2: Update again
+          await g.addNode('u1', ['User'], { status: 'banned' });
+          const _t2 = new Date();
+
+          // Query Current (T2)
+          const current = await g.match(['User']).where({}).select();
+          expect(current[0].status).toBe('banned');
+
+          // Query T0 (Should see 'active')
+          // Note: strict equality might be tricky with microsecond precision,
+          // so we pass a time slightly after T0 or exactly T0.
+          // The query logic is: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+          // At T0: valid_from=T0, valid_to=T1.
+          // Query at T0: T0 <= T0 (True) AND T1 > T0 (True).
+          const q0 = await g.asOf(t0).match(['User']).where({}).select();
+          expect(q0[0].status).toBe('active');
+
+          // Query T1 (Should see 'suspended')
+          const q1 = await g.asOf(t1).match(['User']).where({}).select();
+          expect(q1[0].status).toBe('suspended');
+        });
+
+        test('should handle node lifecycle (create -> delete)', async () => {
+          const setup = await createGraph('disk', 'temporal-lifecycle');
+          g = setup.graph;
+          path = setup.path;
+
+          // T0: Empty
+          const t0 = new Date();
+          await sleep(50);
+
+          // T1: Alive
+          await g.addNode('temp', ['Temp']);
+          const t1 = new Date();
+          await sleep(50);
+
+          // T2: Deleted
+          await g.deleteNode('temp');
+          const t2 = new Date();
+
+          // Verify
+          const resT0 = await g.asOf(t0).match(['Temp']).select();
+          expect(resT0.length).toBe(0);
+
+          const resT1 = await g.asOf(t1).match(['Temp']).select();
+          expect(resT1.length).toBe(1);
+          expect(resT1[0].id).toBe('temp');
+
+          const resT2 = await g.asOf(t2).match(['Temp']).select();
+          expect(resT2.length).toBe(0);
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/e2e/access-control.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('E2E: RBAC (Access Control)', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should resolve nested group memberships to check permissions', async () => {
+          // User -> MEMBER_OF -> Group A -> MEMBER_OF -> Group B -> HAS_PERMISSION -> Resource
+          const setup = await createGraph('disk', 'e2e-rbac');
+          g = setup.graph;
+          path = setup.path;
+
+          await g.addNode('user:alice', ['User']);
+          await g.addNode('group:devs', ['Group']);
+          await g.addNode('group:admins', ['Group']);
+          await g.addNode('res:prod_db', ['Resource']);
+
+          // Alice is in Devs
+          await g.addEdge('user:alice', 'group:devs', 'MEMBER_OF');
+          // Devs is a subset of Admins (Nested Group)
+          await g.addEdge('group:devs', 'group:admins', 'MEMBER_OF');
+          // Admins have access to Prod DB
+          await g.addEdge('group:admins', 'res:prod_db', 'CAN_ACCESS');
+
+          // Query: Can Alice access prod_db?
+          
+          // 1 hop check (Direct access?)
+          const direct = await g.match(['User'])
+              .where({ id: 'user:alice' })
+              .out('CAN_ACCESS')
+              .select(r => r.id);
+          expect(direct).toEqual([]);
+
+          // 2 hop check (Group access)
+          const groupAccess = await g.match(['User'])
+              .where({ id: 'user:alice' })
+              .out('MEMBER_OF')
+              .out('CAN_ACCESS')
+              .select(r => r.id);
+          // Alice -> Devs -x-> ? (Devs don't have direct access)
+          expect(groupAccess).toEqual([]);
+
+          // 3 hop check (Nested Group access)
+          const nestedAccess = await g.match(['User'])
+              .where({ id: 'user:alice' })
+              .out('MEMBER_OF') // Devs
+              .out('MEMBER_OF') // Admins
+              .out('CAN_ACCESS') // Prod DB
+              .select(r => r.id);
+          
+          expect(nestedAccess).toContain('res:prod_db');
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/e2e/fraud.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('E2E: Fraud Detection (Graph Analysis)', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should detect indirect links between users via shared resources', async () => {
+          const setup = await createGraph('disk', 'e2e-fraud');
+          g = setup.graph;
+          path = setup.path;
+
+          // 1. Seed Data: A Fraud Ring
+          // Bad Actor 1 (A) shares a Device with (B).
+          // (B) shares a Credit Card with Bad Actor 2 (C).
+          // Link: A -> Device -> B -> Card -> C
+
+          // Nodes
+          await g.addNode('user:A', ['User'], { riskScore: 90 });
+          await g.addNode('user:B', ['User'], { riskScore: 10 }); // Looks innocent
+          await g.addNode('user:C', ['User'], { riskScore: 95 });
+          
+          await g.addNode('device:D1', ['Device'], { os: 'Android' });
+          await g.addNode('card:C1', ['CreditCard'], { bin: 4242 });
+
+          // Edges
+          await g.addEdge('user:A', 'device:D1', 'USED_DEVICE');
+          await g.addEdge('user:B', 'device:D1', 'USED_DEVICE');
+          
+          await g.addEdge('user:B', 'card:C1', 'USED_CARD');
+          await g.addEdge('user:C', 'card:C1', 'USED_CARD');
+
+          // 2. Query: Find all users linked to 'user:A' via any shared device or card
+          // Path: Start(A) -> out(Device) -> in(Device) -> out(Card) -> in(Card) -> Result(C)
+          // Note: We need to be careful with traversal steps.
+          
+          // Step 1: Find devices used by A
+          // Step 2: Find users who used those devices (getting B)
+          // Step 3: Find cards used by those users (getting C1)
+          // Step 4: Find users who used those cards (getting C)
+          
+          const linkedUsers = await g.match(['User'])
+            .where({ riskScore: 90 }) // Select A
+            .out('USED_DEVICE')       // -> D1
+            .in('USED_DEVICE')        // -> A, B
+            .out('USED_CARD')         // -> C1 (from B)
+            .in('USED_CARD')          // -> B, C
+            .node(['User'])           // Filter just in case
+            .select(u => u.id);
+
+          // 3. Verify
+          // Should contain C. Might contain A and B depending on cycles, which is fine for graph traversal.
+          expect(linkedUsers).toContain('user:C');
+          expect(linkedUsers).toContain('user:B');
+        });
+
+        test('should isolate clean users from the ring', async () => {
+          // Re-use graph or create new? 'afterEach' cleans up, so we need setup again if we wanted clean state.
+          // Since we destroy in afterEach, we need to setup again.
+          // To speed up, we could do this in one test file with one setup, but isolation is requested.
+          // For this specific test, we'll create a new isolated graph.
+          
+          const setup = await createGraph('disk', 'e2e-fraud-clean');
+          const g2 = setup.graph;
+          // We rely on afterEach to clean this path too if we update the `path` variable correctly 
+          // or we can just manually clean this one. 
+          // The `path` variable is scoped to describe, so we update it.
+          path = setup.path; 
+
+          await g2.addNode('good_user', ['User']);
+          await g2.addNode('bad_user', ['User']);
+          await g2.addNode('device:1', ['Device']);
+          await g2.addNode('device:2', ['Device']); // Different device
+
+          await g2.addEdge('good_user', 'device:1', 'USED');
+          await g2.addEdge('bad_user', 'device:2', 'USED');
+
+          const links = await g2.match(['User'])
+            .where({ id: 'good_user' })
+            .out('USED')
+            .in('USED')
+            .select(u => u.id);
+
+          // Should only find themselves (good_user -> device:1 -> good_user)
+          expect(links.length).toBe(1);
+          expect(links[0]).toBe('good_user');
+          expect(links).not.toContain('bad_user');
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/e2e/recommendation.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('E2E: Recommendation Engine (Collaborative Filtering)', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should recommend products based on "Users who bought X also bought Y"', async () => {
+          const setup = await createGraph('disk', 'e2e-recs');
+          g = setup.graph;
+          path = setup.path;
+
+          // Data Setup
+          // Alice bought: Phone, Headphones, Case
+          // Bob bought: Phone
+          // Charlie bought: Headphones
+          
+          // Goal: Recommend "Headphones" and "Case" to Bob because he is similar to Alice (shared Phone).
+          
+          await g.addNode('Alice', ['User']);
+          await g.addNode('Bob', ['User']);
+          await g.addNode('Charlie', ['User']);
+
+          await g.addNode('Phone', ['Product'], { price: 800 });
+          await g.addNode('Headphones', ['Product'], { price: 200 });
+          await g.addNode('Case', ['Product'], { price: 50 });
+
+          // Alice's purchases
+          await g.addEdge('Alice', 'Phone', 'BOUGHT');
+          await g.addEdge('Alice', 'Headphones', 'BOUGHT');
+          await g.addEdge('Alice', 'Case', 'BOUGHT');
+
+          // Bob's purchases
+          await g.addEdge('Bob', 'Phone', 'BOUGHT');
+
+          // Charlie's purchases
+          await g.addEdge('Charlie', 'Headphones', 'BOUGHT');
+
+          // Query for Bob:
+          // 1. What did Bob buy? (Phone)
+          // 2. Who else bought that? (Alice)
+          // 3. What else did they buy? (Headphones, Case)
+          
+          const recs = await g.match(['User'])
+            .where({ id: 'Bob' })
+            .out('BOUGHT')      // -> Phone
+            .in('BOUGHT')       // -> Alice, Bob
+            .out('BOUGHT')      // -> Phone, Headphones, Case
+            .node(['Product'])
+            .select(p => p.id);
+
+          // Result should contain products.
+          // Note: It will contain 'Phone' because Alice bought it too. 
+          // A real engine would filter out already purchased items.
+          
+          const uniqueRecs = [...new Set(recs)];
+          
+          expect(uniqueRecs).toContain('Headphones');
+          expect(uniqueRecs).toContain('Case');
+          expect(uniqueRecs).toContain('Phone');
+        });
+
+        test('should filter recommendations by property (e.g. price < 100)', async () => {
+          // Re-using the graph state from previous test would be ideal if we didn't teardown.
+          // But we teardown. Let's quickly rebuild a smaller version.
+          
+          const setup = await createGraph('disk', 'e2e-recs-filter');
+          g = setup.graph;
+          path = setup.path;
+
+          await g.addNode('U1', ['User']);
+          await g.addNode('U2', ['User']);
+          await g.addNode('Luxury', ['Product'], { price: 1000 });
+          await g.addNode('Cheap', ['Product'], { price: 20 });
+
+          // U1 bought both
+          await g.addEdge('U1', 'Luxury', 'BOUGHT');
+          await g.addEdge('U1', 'Cheap', 'BOUGHT');
+          
+          // U2 bought Luxury
+          await g.addEdge('U2', 'Luxury', 'BOUGHT');
+
+          // Recommend to U2 based on similarity (Luxury), but only Cheap stuff
+          const results = await g.match(['User'])
+            .where({ id: 'U2' })
+            .out('BOUGHT')    // -> Luxury
+            .in('BOUGHT')     // -> U1, U2
+            .out('BOUGHT')    // -> Luxury, Cheap
+            .node(['Product'])
+            .where({ price: 20 }) // DuckDB Filter
+            .select(p => p.id);
+
+          expect(results).toContain('Cheap');
+          expect(results).not.toContain('Luxury');
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/e2e/social.test.ts
+    content: |-
+      import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('E2E: Social Network', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        beforeEach(async () => {
+          // We use disk to ensure full stack is exercised, though memory works too
+          const setup = await createGraph('disk');
+          g = setup.graph;
+          path = setup.path;
+
+          // Seed Data
+          // Alice -> Bob -> Charlie
+          // Alice (30), Bob (25), Charlie (20)
+          await g.addNode('alice', ['User'], { name: 'Alice', age: 30, city: 'NY' });
+          await g.addNode('bob', ['User'], { name: 'Bob', age: 25, city: 'SF' });
+          await g.addNode('charlie', ['User'], { name: 'Charlie', age: 20, city: 'NY' });
+          await g.addNode('dave', ['User'], { name: 'Dave', age: 40, city: 'NY' });
+
+          await g.addEdge('alice', 'bob', 'KNOWS', { since: 2020 });
+          await g.addEdge('bob', 'charlie', 'KNOWS', { since: 2022 });
+          await g.addEdge('alice', 'dave', 'KNOWS', { since: 2010 });
+        });
+
+        afterEach(async () => {
+          await cleanupGraph(path);
+        });
+
+        test('Query: Filter -> Traversal -> Select', async () => {
+          // Find Users named Alice, see who they know
+          const results = await g.match(['User'])
+            .where({ name: 'Alice' })
+            .out('KNOWS')
+            .node(['User'])
+            .select(u => u.name);
+          
+          // Alice knows Bob and Dave
+          expect(results.length).toBe(2);
+          expect(results.sort()).toEqual(['Bob', 'Dave']);
+        });
+
+        test('Query: Filter -> Traversal -> Filter (Sandwich)', async () => {
+          // Find Users named Alice, find who they know that is UNDER 30
+          // This requires DuckDB post-filter
+          // Alice knows Bob (25) and Dave (40). Should only return Bob.
+          
+          // Note: The current fluent API in 'query.ts' supports basic where()
+          // For V1 simple object matching, we can match { age: 25 } but not { age: < 30 } easily without helper
+          // Let's test exact match for now as per current implementation, 
+          // or rely on the query builder logic to pass raw values.
+          
+          const results = await g.match(['User'])
+            .where({ name: 'Alice' })
+            .out('KNOWS')
+            .node(['User'])
+            .where({ age: 25 }) // Filter for Bob
+            .select(u => u.name);
+
+          expect(results).toEqual(['Bob']);
+        });
+
+        test('Optimization: Property Promotion', async () => {
+          // Promote 'age' to a native column (INTEGER)
+          // This is an async schema change
+          await g.optimize.promoteProperty('User', 'age', 'INTEGER');
+
+          // Run the same query again to ensure it still works (transparent to user)
+          // The query builder generates `json_extract(properties, '$.age')` which works even if column exists,
+          // or DuckDB handles the ambiguity. 
+          // Ideally, the query builder should be smart enough to use the column, but for now we test stability.
+          
+          const results = await g.match(['User'])
+            .where({ name: 'Charlie' })
+            .select(u => u.age);
+
+          expect(results[0]).toBe(20);
+          
+          // Verify column exists in schema
+          const tableInfo = await g.db.query("PRAGMA table_info('nodes')");
+          const hasAge = tableInfo.some(c => c.name === 'age' && c.type === 'INTEGER');
+          expect(hasAge).toBe(true);
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/e2e/supply-chain.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('E2E: Supply Chain Impact Analysis', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should identify all finished goods affected by a defective raw material', async () => {
+          // Scenario:
+          // Raw Material (Lithium) -> Component (Battery) -> Sub-Assembly (PowerPack) -> Product (EV Car)
+          //                                               -> Product (PowerWall)
+          // Raw Material (Steel)   -> Component (Chassis) -> Product (EV Car)
+          
+          const setup = await createGraph('disk', 'e2e-supply-chain');
+          g = setup.graph;
+          path = setup.path;
+
+          // 1. Ingest Data
+          await g.addNode('mat:lithium', ['Material'], { batch: 'BATCH-001' });
+          await g.addNode('mat:steel', ['Material']);
+          
+          await g.addNode('comp:battery', ['Component']);
+          await g.addNode('comp:chassis', ['Component']);
+          
+          await g.addNode('sub:powerpack', ['SubAssembly']);
+          
+          await g.addNode('prod:car', ['Product']);
+          await g.addNode('prod:wall', ['Product']);
+
+          // Flows
+          await g.addEdge('mat:lithium', 'comp:battery', 'PART_OF');
+          await g.addEdge('comp:battery', 'sub:powerpack', 'PART_OF');
+          await g.addEdge('sub:powerpack', 'prod:car', 'PART_OF');
+          await g.addEdge('sub:powerpack', 'prod:wall', 'PART_OF');
+          
+          await g.addEdge('mat:steel', 'comp:chassis', 'PART_OF');
+          await g.addEdge('comp:chassis', 'prod:car', 'PART_OF');
+
+          // 2. Query: The 'Lithium' batch is bad. Find all Products.
+          
+          // Depth 1: Battery
+          const depth1 = await g.match(['Material'])
+              .where({ id: 'mat:lithium' })
+              .out('PART_OF')
+              .select(n => n.id);
+          expect(depth1).toContain('comp:battery');
+
+          // Depth 2: Powerpack
+          const depth2 = await g.match(['Material'])
+              .where({ id: 'mat:lithium' })
+              .out('PART_OF')
+              .out('PART_OF')
+              .select(n => n.id);
+          expect(depth2).toContain('sub:powerpack');
+
+          // Depth 3: Products (Car, Wall)
+          const affectedProducts = await g.match(['Material'])
+              .where({ id: 'mat:lithium' })
+              .out('PART_OF') // Battery
+              .out('PART_OF') // Powerpack
+              .out('PART_OF') // Car, Wall
+              .node(['Product'])
+              .select(n => n.id);
+
+          expect(affectedProducts.length).toBe(2);
+          expect(affectedProducts).toContain('prod:car');
+          expect(affectedProducts).toContain('prod:wall');
+          
+          // Ensure Steel path didn't contaminate results (Steel -> Chassis -> Car)
+          // Our path started at Lithium, so it shouldn't pick up Chassis unless connected.
+          
+          const steelProducts = await g.match(['Material'])
+              .where({ id: 'mat:steel' })
+              .out('PART_OF') // Chassis
+              .out('PART_OF') // Car
+              .node(['Product'])
+              .select(n => n.id);
+              
+          expect(steelProducts).toEqual(['prod:car']);
+          expect(steelProducts).not.toContain('prod:wall');
+        });
+      });
+    patchStrategy: replace
+snapshot:
+  test/integration/complex-query.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph } from '../utils/helpers';
+    import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('Integration: Complex Query Logic', () => {
+      let g: QuackGraph;
+      let path: string;
+
+      afterEach(async () => {
+        if (path) await cleanupGraph(path);
+      });
+
+      test('should support the "Sandwich" pattern: Filter -> Traverse -> Filter', async () => {
+        const setup = await createGraph('disk', 'int-complex-query');
+        g = setup.graph;
+        path = setup.path;
+
+        // Graph:
+        // User(Active) -> KNOWS -> User(Active, Age 20)
+        // User(Active) -> KNOWS -> User(Inactive, Age 20)
+        // User(Active) -> KNOWS -> User(Active, Age 50)
+
+        await g.addNode('start', ['User'], { status: 'active' });
+        
+        await g.addNode('u1', ['User'], { status: 'active', age: 20 });
+        await g.addNode('u2', ['User'], { status: 'inactive', age: 20 });
+        await g.addNode('u3', ['User'], { status: 'active', age: 50 });
+
+        await g.addEdge('start', 'u1', 'KNOWS');
+        await g.addEdge('start', 'u2', 'KNOWS');
+        await g.addEdge('start', 'u3', 'KNOWS');
+
+        // Query: Start node (status=active) -> KNOWS -> End node (status=active AND age=20)
+        const results = await g.match(['User'])
+            .where({ id: 'start', status: 'active' }) // Initial Filter
+            .out('KNOWS')                             // Traversal
+            .node(['User'])
+            .where({ status: 'active', age: 20 })     // Terminal Filter
+            .select(u => u.id);
+
+        expect(results.length).toBe(1);
+        expect(results[0]).toBe('u1');
+      });
+
+      test('should handle empty intermediate results gracefully', async () => {
+        const setup = await createGraph('disk', 'int-empty-query');
+        g = setup.graph;
+        path = setup.path;
+
+        await g.addNode('a', ['Node']);
+        
+        const results = await g.match(['Node'])
+            .where({ id: 'a' })
+            .out('MISSING_EDGE')
+            .out('ANOTHER_EDGE')
+            .select(n => n.id);
+
+        expect(results).toEqual([]);
+      });
+    });
+  test/integration/errors.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph } from '../utils/helpers';
+    import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('Integration: Error Handling & Edge Cases', () => {
+      let g: QuackGraph;
+      let path: string;
+
+      afterEach(async () => {
+        if (path) await cleanupGraph(path);
+      });
+
+      test('should allow edges to non-existent nodes (Graph Pattern Matching behavior)', async () => {
+        // QuackGraph V1 is schemaless. It allows adding edges to nodes that haven't been explicitly created.
+        // However, since those nodes don't exist in the 'nodes' table, they should be filtered out 
+        // during the final hydration (SELECT * FROM nodes) step of the query builder.
+        
+        const setup = await createGraph('disk', 'int-errors');
+        g = setup.graph;
+        path = setup.path;
+
+        await g.addNode('real_node', ['Node']);
+        // Edge to phantom node
+        await g.addEdge('real_node', 'phantom_node', 'LINK');
+
+        // 1. Native Traversal should find it (Topology exists)
+        const nativeNeighbors = g.native.traverse(['real_node'], 'LINK', 'out');
+        expect(nativeNeighbors).toContain('phantom_node');
+
+        // 2. Query Builder should NOT return it (Data missing)
+        const neighbors = await g.match(['Node'])
+            .where({ id: 'real_node' })
+            .out('LINK')
+            .select(n => n.id);
+
+        expect(neighbors.length).toBe(0); 
+      });
+
+      test('should handle special characters in IDs', async () => {
+        const setup = await createGraph('disk', 'int-special-chars');
+        g = setup.graph;
+        path = setup.path;
+
+        const crazyId = 'Node/With"Quotes\'And\\Backslashes 🦆';
+        await g.addNode(crazyId, ['Node']);
+        await g.addNode('b', ['Node']);
+        await g.addEdge(crazyId, 'b', 'LINK');
+
+        const result = await g.match(['Node'])
+            .where({ id: crazyId })
+            .out('LINK')
+            .select(n => n.id);
+            
+        expect(result).toEqual(['b']);
+        
+        // Reverse check
+        const reverse = await g.match(['Node'])
+            .where({ id: 'b' })
+            .in('LINK')
+            .select(n => n.id);
+        
+        expect(reverse).toEqual([crazyId]);
+      });
+    });
+  test/e2e/fraud.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph } from '../utils/helpers';
+    import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('E2E: Fraud Detection (Graph Analysis)', () => {
+      let g: QuackGraph;
+      let path: string;
+
+      afterEach(async () => {
+        if (path) await cleanupGraph(path);
+      });
+
+      test('should detect indirect links between users via shared resources', async () => {
+        const setup = await createGraph('disk', 'e2e-fraud');
+        g = setup.graph;
+        path = setup.path;
+
+        // 1. Seed Data: A Fraud Ring
+        // Bad Actor 1 (A) shares a Device with (B).
+        // (B) shares a Credit Card with Bad Actor 2 (C).
+        // Link: A -> Device -> B -> Card -> C
+
+        // Nodes
+        await g.addNode('user:A', ['User'], { riskScore: 90 });
+        await g.addNode('user:B', ['User'], { riskScore: 10 }); // Looks innocent
+        await g.addNode('user:C', ['User'], { riskScore: 95 });
+        
+        await g.addNode('device:D1', ['Device'], { os: 'Android' });
+        await g.addNode('card:C1', ['CreditCard'], { bin: 4242 });
+
+        // Edges
+        await g.addEdge('user:A', 'device:D1', 'USED_DEVICE');
+        await g.addEdge('user:B', 'device:D1', 'USED_DEVICE');
+        
+        await g.addEdge('user:B', 'card:C1', 'USED_CARD');
+        await g.addEdge('user:C', 'card:C1', 'USED_CARD');
+
+        // 2. Query: Find all users linked to 'user:A' via any shared device or card
+        // Path: Start(A) -> out(Device) -> in(Device) -> out(Card) -> in(Card) -> Result(C)
+        // Note: We need to be careful with traversal steps.
+        
+        // Step 1: Find devices used by A
+        // Step 2: Find users who used those devices (getting B)
+        // Step 3: Find cards used by those users (getting C1)
+        // Step 4: Find users who used those cards (getting C)
+        
+        const linkedUsers = await g.match(['User'])
+          .where({ riskScore: 90 }) // Select A
+          .out('USED_DEVICE')       // -> D1
+          .in('USED_DEVICE')        // -> A, B
+          .out('USED_CARD')         // -> C1 (from B)
+          .in('USED_CARD')          // -> B, C
+          .node(['User'])           // Filter just in case
+          .select(u => u.id);
+
+        // 3. Verify
+        // Should contain C. Might contain A and B depending on cycles, which is fine for graph traversal.
+        expect(linkedUsers).toContain('user:C');
+        expect(linkedUsers).toContain('user:B');
+      });
+
+      test('should isolate clean users from the ring', async () => {
+        // Re-use graph or create new? 'afterEach' cleans up, so we need setup again if we wanted clean state.
+        // Since we destroy in afterEach, we need to setup again.
+        // To speed up, we could do this in one test file with one setup, but isolation is requested.
+        // For this specific test, we'll create a new isolated graph.
+        
+        const setup = await createGraph('disk', 'e2e-fraud-clean');
+        const g2 = setup.graph;
+        // We rely on afterEach to clean this path too if we update the `path` variable correctly 
+        // or we can just manually clean this one. 
+        // The `path` variable is scoped to describe, so we update it.
+        path = setup.path; 
+
+        await g2.addNode('good_user', ['User']);
+        await g2.addNode('bad_user', ['User']);
+        await g2.addNode('device:1', ['Device']);
+        await g2.addNode('device:2', ['Device']); // Different device
+
+        await g2.addEdge('good_user', 'device:1', 'USED');
+        await g2.addEdge('bad_user', 'device:2', 'USED');
+
+        const links = await g2.match(['User'])
+          .where({ id: 'good_user' })
+          .out('USED')
+          .in('USED')
+          .select(u => u.id);
+
+        // Should only find themselves (good_user -> device:1 -> good_user)
+        expect(links.length).toBe(1);
+        expect(links[0]).toBe('good_user');
+        expect(links).not.toContain('bad_user');
+      });
+    });
+  test/e2e/access-control.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph } from '../utils/helpers';
+    import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('E2E: RBAC (Access Control)', () => {
+      let g: QuackGraph;
+      let path: string;
+
+      afterEach(async () => {
+        if (path) await cleanupGraph(path);
+      });
+
+      test('should resolve nested group memberships to check permissions', async () => {
+        // User -> MEMBER_OF -> Group A -> MEMBER_OF -> Group B -> HAS_PERMISSION -> Resource
+        const setup = await createGraph('disk', 'e2e-rbac');
+        g = setup.graph;
+        path = setup.path;
+
+        await g.addNode('user:alice', ['User']);
+        await g.addNode('group:devs', ['Group']);
+        await g.addNode('group:admins', ['Group']);
+        await g.addNode('res:prod_db', ['Resource']);
+
+        // Alice is in Devs
+        await g.addEdge('user:alice', 'group:devs', 'MEMBER_OF');
+        // Devs is a subset of Admins (Nested Group)
+        await g.addEdge('group:devs', 'group:admins', 'MEMBER_OF');
+        // Admins have access to Prod DB
+        await g.addEdge('group:admins', 'res:prod_db', 'CAN_ACCESS');
+
+        // Query: Can Alice access prod_db?
+        
+        // 1 hop check (Direct access?)
+        const direct = await g.match(['User'])
+            .where({ id: 'user:alice' })
+            .out('CAN_ACCESS')
+            .select(r => r.id);
+        expect(direct).toEqual([]);
+
+        // 2 hop check (Group access)
+        const groupAccess = await g.match(['User'])
+            .where({ id: 'user:alice' })
+            .out('MEMBER_OF')
+            .out('CAN_ACCESS')
+            .select(r => r.id);
+        // Alice -> Devs -x-> ? (Devs don't have direct access)
+        expect(groupAccess).toEqual([]);
+
+        // 3 hop check (Nested Group access)
+        const nestedAccess = await g.match(['User'])
+            .where({ id: 'user:alice' })
+            .out('MEMBER_OF') // Devs
+            .out('MEMBER_OF') // Admins
+            .out('CAN_ACCESS') // Prod DB
+            .select(r => r.id);
+        
+        expect(nestedAccess).toContain('res:prod_db');
+      });
+    });
+  test/e2e/recommendation.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph } from '../utils/helpers';
+    import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('E2E: Recommendation Engine (Collaborative Filtering)', () => {
+      let g: QuackGraph;
+      let path: string;
+
+      afterEach(async () => {
+        if (path) await cleanupGraph(path);
+      });
+
+      test('should recommend products based on "Users who bought X also bought Y"', async () => {
+        const setup = await createGraph('disk', 'e2e-recs');
+        g = setup.graph;
+        path = setup.path;
+
+        // Data Setup
+        // Alice bought: Phone, Headphones, Case
+        // Bob bought: Phone
+        // Charlie bought: Headphones
+        
+        // Goal: Recommend "Headphones" and "Case" to Bob because he is similar to Alice (shared Phone).
+        
+        await g.addNode('Alice', ['User']);
+        await g.addNode('Bob', ['User']);
+        await g.addNode('Charlie', ['User']);
+
+        await g.addNode('Phone', ['Product'], { price: 800 });
+        await g.addNode('Headphones', ['Product'], { price: 200 });
+        await g.addNode('Case', ['Product'], { price: 50 });
+
+        // Alice's purchases
+        await g.addEdge('Alice', 'Phone', 'BOUGHT');
+        await g.addEdge('Alice', 'Headphones', 'BOUGHT');
+        await g.addEdge('Alice', 'Case', 'BOUGHT');
+
+        // Bob's purchases
+        await g.addEdge('Bob', 'Phone', 'BOUGHT');
+
+        // Charlie's purchases
+        await g.addEdge('Charlie', 'Headphones', 'BOUGHT');
+
+        // Query for Bob:
+        // 1. What did Bob buy? (Phone)
+        // 2. Who else bought that? (Alice)
+        // 3. What else did they buy? (Headphones, Case)
+        
+        const recs = await g.match(['User'])
+          .where({ id: 'Bob' })
+          .out('BOUGHT')      // -> Phone
+          .in('BOUGHT')       // -> Alice, Bob
+          .out('BOUGHT')      // -> Phone, Headphones, Case
+          .node(['Product'])
+          .select(p => p.id);
+
+        // Result should contain products.
+        // Note: It will contain 'Phone' because Alice bought it too. 
+        // A real engine would filter out already purchased items.
+        
+        const uniqueRecs = [...new Set(recs)];
+        
+        expect(uniqueRecs).toContain('Headphones');
+        expect(uniqueRecs).toContain('Case');
+        expect(uniqueRecs).toContain('Phone');
+      });
+
+      test('should filter recommendations by property (e.g. price < 100)', async () => {
+        // Re-using the graph state from previous test would be ideal if we didn't teardown.
+        // But we teardown. Let's quickly rebuild a smaller version.
+        
+        const setup = await createGraph('disk', 'e2e-recs-filter');
+        g = setup.graph;
+        path = setup.path;
+
+        await g.addNode('U1', ['User']);
+        await g.addNode('U2', ['User']);
+        await g.addNode('Luxury', ['Product'], { price: 1000 });
+        await g.addNode('Cheap', ['Product'], { price: 20 });
+
+        // U1 bought both
+        await g.addEdge('U1', 'Luxury', 'BOUGHT');
+        await g.addEdge('U1', 'Cheap', 'BOUGHT');
+        
+        // U2 bought Luxury
+        await g.addEdge('U2', 'Luxury', 'BOUGHT');
+
+        // Recommend to U2 based on similarity (Luxury), but only Cheap stuff
+        const results = await g.match(['User'])
+          .where({ id: 'U2' })
+          .out('BOUGHT')    // -> Luxury
+          .in('BOUGHT')     // -> U1, U2
+          .out('BOUGHT')    // -> Luxury, Cheap
+          .node(['Product'])
+          .where({ price: 20 }) // DuckDB Filter
+          .select(p => p.id);
+
+        expect(results).toContain('Cheap');
+        expect(results).not.toContain('Luxury');
+      });
+    });
+  test/e2e/social.test.ts: |-
+    import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph } from '../utils/helpers';
+    import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('E2E: Social Network', () => {
+      let g: QuackGraph;
+      let path: string;
+
+      beforeEach(async () => {
+        // We use disk to ensure full stack is exercised, though memory works too
+        const setup = await createGraph('disk');
+        g = setup.graph;
+        path = setup.path;
+
+        // Seed Data
+        // Alice -> Bob -> Charlie
+        // Alice (30), Bob (25), Charlie (20)
+        await g.addNode('alice', ['User'], { name: 'Alice', age: 30, city: 'NY' });
+        await g.addNode('bob', ['User'], { name: 'Bob', age: 25, city: 'SF' });
+        await g.addNode('charlie', ['User'], { name: 'Charlie', age: 20, city: 'NY' });
+        await g.addNode('dave', ['User'], { name: 'Dave', age: 40, city: 'NY' });
+
+        await g.addEdge('alice', 'bob', 'KNOWS', { since: 2020 });
+        await g.addEdge('bob', 'charlie', 'KNOWS', { since: 2022 });
+        await g.addEdge('alice', 'dave', 'KNOWS', { since: 2010 });
+      });
+
+      afterEach(async () => {
+        await cleanupGraph(path);
+      });
+
+      test('Query: Filter -> Traversal -> Select', async () => {
+        // Find Users named Alice, see who they know
+        const results = await g.match(['User'])
+          .where({ name: 'Alice' })
+          .out('KNOWS')
+          .node(['User'])
+          .select(u => u.name);
+        
+        // Alice knows Bob and Dave
+        expect(results.length).toBe(2);
+        expect(results.sort()).toEqual(['Bob', 'Dave']);
+      });
+
+      test('Query: Filter -> Traversal -> Filter (Sandwich)', async () => {
+        // Find Users named Alice, find who they know that is UNDER 30
+        // This requires DuckDB post-filter
+        // Alice knows Bob (25) and Dave (40). Should only return Bob.
+        
+        // Note: The current fluent API in 'query.ts' supports basic where()
+        // For V1 simple object matching, we can match { age: 25 } but not { age: < 30 } easily without helper
+        // Let's test exact match for now as per current implementation, 
+        // or rely on the query builder logic to pass raw values.
+        
+        const results = await g.match(['User'])
+          .where({ name: 'Alice' })
+          .out('KNOWS')
+          .node(['User'])
+          .where({ age: 25 }) // Filter for Bob
+          .select(u => u.name);
+
+        expect(results).toEqual(['Bob']);
+      });
+
+      test('Optimization: Property Promotion', async () => {
+        // Promote 'age' to a native column (INTEGER)
+        // This is an async schema change
+        await g.optimize.promoteProperty('User', 'age', 'INTEGER');
+
+        // Run the same query again to ensure it still works (transparent to user)
+        // The query builder generates `json_extract(properties, '$.age')` which works even if column exists,
+        // or DuckDB handles the ambiguity. 
+        // Ideally, the query builder should be smart enough to use the column, but for now we test stability.
+        
+        const results = await g.match(['User'])
+          .where({ name: 'Charlie' })
+          .select(u => u.age);
+
+        expect(results[0]).toBe(20);
+        
+        // Verify column exists in schema
+        const tableInfo = await g.db.query("PRAGMA table_info('nodes')");
+        const hasAge = tableInfo.some(c => c.name === 'age' && c.type === 'INTEGER');
+        expect(hasAge).toBe(true);
+      });
+    });
+  test/integration/temporal.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph, sleep } from '../utils/helpers';
+    import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('Integration: Temporal Time-Travel', () => {
+      let g: QuackGraph;
+      let path: string;
+
+      afterEach(async () => {
+        if (path) await cleanupGraph(path);
+      });
+
+      test('should retrieve historical property values using asOf', async () => {
+        const setup = await createGraph('disk', 'temporal-props');
+        g = setup.graph;
+        path = setup.path;
+
+        // T0: Create
+        await g.addNode('u1', ['User'], { status: 'active' });
+        const t0 = new Date();
+        await sleep(100); // Ensure clock tick
+
+        // T1: Update
+        await g.addNode('u1', ['User'], { status: 'suspended' });
+        const t1 = new Date();
+        await sleep(100);
+
+        // T2: Update again
+        await g.addNode('u1', ['User'], { status: 'banned' });
+        const _t2 = new Date();
+
+        // Query Current (T2)
+        const current = await g.match(['User']).where({}).select();
+        expect(current[0].status).toBe('banned');
+
+        // Query T0 (Should see 'active')
+        // Note: strict equality might be tricky with microsecond precision,
+        // so we pass a time slightly after T0 or exactly T0.
+        // The query logic is: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+        // At T0: valid_from=T0, valid_to=T1.
+        // Query at T0: T0 <= T0 (True) AND T1 > T0 (True).
+        const q0 = await g.asOf(t0).match(['User']).where({}).select();
+        expect(q0[0].status).toBe('active');
+
+        // Query T1 (Should see 'suspended')
+        const q1 = await g.asOf(t1).match(['User']).where({}).select();
+        expect(q1[0].status).toBe('suspended');
+      });
+
+      test('should handle node lifecycle (create -> delete)', async () => {
+        const setup = await createGraph('disk', 'temporal-lifecycle');
+        g = setup.graph;
+        path = setup.path;
+
+        // T0: Empty
+        const t0 = new Date();
+        await sleep(50);
+
+        // T1: Alive
+        await g.addNode('temp', ['Temp']);
+        const t1 = new Date();
+        await sleep(50);
+
+        // T2: Deleted
+        await g.deleteNode('temp');
+        const t2 = new Date();
+
+        // Verify
+        const resT0 = await g.asOf(t0).match(['Temp']).select();
+        expect(resT0.length).toBe(0);
+
+        const resT1 = await g.asOf(t1).match(['Temp']).select();
+        expect(resT1.length).toBe(1);
+        expect(resT1[0].id).toBe('temp');
+
+        const resT2 = await g.asOf(t2).match(['Temp']).select();
+        expect(resT2.length).toBe(0);
+      });
+    });
+  test/e2e/supply-chain.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph } from '../utils/helpers';
+    import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('E2E: Supply Chain Impact Analysis', () => {
+      let g: QuackGraph;
+      let path: string;
+
+      afterEach(async () => {
+        if (path) await cleanupGraph(path);
+      });
+
+      test('should identify all finished goods affected by a defective raw material', async () => {
+        // Scenario:
+        // Raw Material (Lithium) -> Component (Battery) -> Sub-Assembly (PowerPack) -> Product (EV Car)
+        //                                               -> Product (PowerWall)
+        // Raw Material (Steel)   -> Component (Chassis) -> Product (EV Car)
+        
+        const setup = await createGraph('disk', 'e2e-supply-chain');
+        g = setup.graph;
+        path = setup.path;
+
+        // 1. Ingest Data
+        await g.addNode('mat:lithium', ['Material'], { batch: 'BATCH-001' });
+        await g.addNode('mat:steel', ['Material']);
+        
+        await g.addNode('comp:battery', ['Component']);
+        await g.addNode('comp:chassis', ['Component']);
+        
+        await g.addNode('sub:powerpack', ['SubAssembly']);
+        
+        await g.addNode('prod:car', ['Product']);
+        await g.addNode('prod:wall', ['Product']);
+
+        // Flows
+        await g.addEdge('mat:lithium', 'comp:battery', 'PART_OF');
+        await g.addEdge('comp:battery', 'sub:powerpack', 'PART_OF');
+        await g.addEdge('sub:powerpack', 'prod:car', 'PART_OF');
+        await g.addEdge('sub:powerpack', 'prod:wall', 'PART_OF');
+        
+        await g.addEdge('mat:steel', 'comp:chassis', 'PART_OF');
+        await g.addEdge('comp:chassis', 'prod:car', 'PART_OF');
+
+        // 2. Query: The 'Lithium' batch is bad. Find all Products.
+        
+        // Depth 1: Battery
+        const depth1 = await g.match(['Material'])
+            .where({ id: 'mat:lithium' })
+            .out('PART_OF')
+            .select(n => n.id);
+        expect(depth1).toContain('comp:battery');
+
+        // Depth 2: Powerpack
+        const depth2 = await g.match(['Material'])
+            .where({ id: 'mat:lithium' })
+            .out('PART_OF')
+            .out('PART_OF')
+            .select(n => n.id);
+        expect(depth2).toContain('sub:powerpack');
+
+        // Depth 3: Products (Car, Wall)
+        const affectedProducts = await g.match(['Material'])
+            .where({ id: 'mat:lithium' })
+            .out('PART_OF') // Battery
+            .out('PART_OF') // Powerpack
+            .out('PART_OF') // Car, Wall
+            .node(['Product'])
+            .select(n => n.id);
+
+        expect(affectedProducts.length).toBe(2);
+        expect(affectedProducts).toContain('prod:car');
+        expect(affectedProducts).toContain('prod:wall');
+        
+        // Ensure Steel path didn't contaminate results (Steel -> Chassis -> Car)
+        // Our path started at Lithium, so it shouldn't pick up Chassis unless connected.
+        
+        const steelProducts = await g.match(['Material'])
+            .where({ id: 'mat:steel' })
+            .out('PART_OF') // Chassis
+            .out('PART_OF') // Car
+            .node(['Product'])
+            .select(n => n.id);
+            
+        expect(steelProducts).toEqual(['prod:car']);
+        expect(steelProducts).not.toContain('prod:wall');
+      });
+    });
+approved: true
+linesAdded: 0
+linesRemoved: 0
+linesDifference: 0
+gitCommittedAt: '2025-12-02T12:44:32.423Z'
+status: committed
+id: 39

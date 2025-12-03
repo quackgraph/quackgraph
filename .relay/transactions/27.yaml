@@ -1,0 +1,674 @@
+uuid: 4c11f7c1-7d9a-4e2b-8a5c-5f6e8b4e9f3a
+projectId: quackgraph
+createdAt: '2025-12-02T10:23:55.037Z'
+gitCommitMsg: >-
+  fix: handle DuckDB JSON parameters and Arrow Dictionary types
+
+  - Fixed 'Malformed JSON' error in QueryBuilder by ensuring filter values are
+  stringified and cast to ::JSON in DuckDB SQL. - Fixed 'Unsupported type
+  Dictionary' error during hydration in Rust topology by automatically casting
+  Dictionary arrays to Utf8.
+promptSummary: >-
+  Fixed DuckDB JSON comparison errors in queries by casting parameters to JSON.
+  Fixed Rust Graph Index hydration error by supporting Arrow Dictionary Arrays
+  via casting to Utf8.
+reasoning:
+  - >-
+    Step 1: Fix `packages/quack-graph/src/query.ts` to properly serialize
+    parameters for JSON comparison in DuckDB.
+  - >-
+    Step 2: Fix `crates/quack_core/src/topology.rs` to handle
+    `DataType::Dictionary` (which DuckDB produces for string columns) by casting
+    to `Utf8`.
+operations:
+  - type: write
+    path: packages/quack-graph/src/query.ts
+    content: >
+      --- packages/quack-graph/src/query.ts
+
+      +++ packages/quack-graph/src/query.ts
+
+      @@ -104,8 +104,8 @@
+           // 1.c Property Filter
+           for (const [key, value] of Object.entries(this.initialFilters)) {
+      -      conditions.push(`json_extract(properties, '$.${key}') = ?`);
+
+      -      params.push(value);
+
+      +      conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+
+      +      params.push(JSON.stringify(value));
+           }
+       
+           // 1.d Vector Search (Order By Distance)
+      @@ -174,8 +174,8 @@
+           // 3.c Terminal Property Filters
+           for (const [key, value] of Object.entries(this.terminalFilters)) {
+      -      finalConditions.push(`json_extract(properties, '$.${key}') = ?`);
+
+      -      finalParams.push(value);
+
+      +      finalConditions.push(`json_extract(properties, '$.${key}') =
+      ?::JSON`);
+
+      +      finalParams.push(JSON.stringify(value));
+           }
+       
+           const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join(' AND ')}`;
+    patchStrategy: standard-diff
+  - type: write
+    path: crates/quack_core/src/topology.rs
+    content: >
+      --- crates/quack_core/src/topology.rs
+
+      +++ crates/quack_core/src/topology.rs
+
+      @@ -7,6 +7,7 @@
+       use arrow::record_batch::RecordBatch;
+       use arrow::array::{AsArray, Array, StringArray, LargeStringArray};
+       use arrow::datatypes::DataType;
+      +use arrow::compute::cast;
+       
+       /// The core Graph Index.
+       /// Stores topology in RAM using integer IDs.
+      @@ -188,27 +189,35 @@
+                   schema.fields().iter().position(|f| f.name().eq_ignore_ascii_case(name))
+                       .ok_or_else(|| format!("Column '{}' not found in Arrow Batch. Available: {:?}", name, schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()))
+               };
+      -
+
+      -        let src_idx = find_col("source")?;
+
+      -        let tgt_idx = find_col("target")?;
+
+      -        let type_idx = find_col("type")?;
+
+      -
+
+      +        
+               let num_rows = batch.num_rows();
+               if num_rows == 0 {
+                   return Ok(());
+               }
+       
+      +        // Helper to ensure we have a String/LargeString array, casting
+      Dictionary if needed
+
+      +        let prepare_col = |col: &std::sync::Arc<dyn Array>, name: &str|
+      -> Result<std::sync::Arc<dyn Array>, String> {
+
+      +            match col.data_type() {
+
+      +                DataType::Utf8 | DataType::LargeUtf8 => Ok(col.clone()),
+
+      +                DataType::Dictionary(_, value_type) => {
+
+      +                    if matches!(value_type.as_ref(), DataType::Utf8 |
+      DataType::LargeUtf8) {
+
+      +                        cast(col.as_ref(), &DataType::Utf8).map_err(|e|
+      format!("Cast error for {}: {}", name, e))
+
+      +                    } else {
+
+      +                        Err(format!("{} column: Dictionary value type
+      {:?} not supported (expected Utf8)", name, value_type))
+
+      +                    }
+
+      +                },
+
+      +                dt => Err(format!("{} column: Unsupported type {:?}",
+      name, dt)),
+
+      +            }
+
+      +        };
+
+      +
+
+      +        let src_col = prepare_col(batch.column(find_col("source")?),
+      "Source")?;
+
+      +        let tgt_col = prepare_col(batch.column(find_col("target")?),
+      "Target")?;
+
+      +        let type_col = prepare_col(batch.column(find_col("type")?),
+      "Type")?;
+
+      +
+               // Wrapper to handle different string array types (Utf8 vs LargeUtf8)
+               enum StringArrayWrapper<'a> {
+                   Small(&'a StringArray),
+                   Large(&'a LargeStringArray),
+               }
+       
+               impl<'a> StringArrayWrapper<'a> {
+      @@ -218,17 +227,14 @@
+                           Self::Large(arr) => arr.value(i),
+                       }
+                   }
+               }
+       
+               macro_rules! get_wrapper {
+      -            ($col:expr, $name:expr) => {
+
+      +            ($col:expr) => {
+                       match $col.data_type() {
+                           DataType::Utf8 => StringArrayWrapper::Small($col.as_string::<i32>()),
+                           DataType::LargeUtf8 => StringArrayWrapper::Large($col.as_string::<i64>()),
+      -                    dt => return Err(format!("{} column: Unsupported type
+      {:?}", $name, dt)),
+
+      +                    _ => unreachable!("Already validated/casted to
+      Utf8/LargeUtf8"),
+                       }
+                   }
+               }
+       
+      -        let src_wrapper = get_wrapper!(batch.column(src_idx), "Source");
+
+      -        let tgt_wrapper = get_wrapper!(batch.column(tgt_idx), "Target");
+
+      -        let type_wrapper = get_wrapper!(batch.column(type_idx), "Type");
+
+      +        let src_wrapper = get_wrapper!(src_col);
+
+      +        let tgt_wrapper = get_wrapper!(tgt_col);
+
+      +        let type_wrapper = get_wrapper!(type_col);
+       
+               for i in 0..num_rows {
+                   self.add_edge(src_wrapper.value(i), tgt_wrapper.value(i), type_wrapper.value(i));
+    patchStrategy: standard-diff
+snapshot:
+  packages/quack-graph/src/query.ts: |-
+    import type { QuackGraph } from './graph';
+
+    type TraversalStep = {
+      type: 'out' | 'in';
+      edge: string;
+    };
+
+    export class QueryBuilder {
+      private graph: QuackGraph;
+      private startLabels: string[];
+      private endLabels: string[] = [];
+
+      // Bottom Bun Filters (Initial selection)
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      private initialFilters: Record<string, any> = {};
+      private vectorSearch: { vector: number[]; limit: number } | null = null;
+
+      // The Meat (Traversal)
+      private traversals: TraversalStep[] = [];
+
+      // Top Bun Filters (Final selection)
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      private terminalFilters: Record<string, any> = {};
+
+      constructor(graph: QuackGraph, labels: string[]) {
+        this.graph = graph;
+        this.startLabels = labels;
+      }
+
+      /**
+       * Filter nodes by properties.
+       * If called before traversal, applies to Start Nodes.
+       * If called after traversal, applies to End Nodes.
+       */
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      where(criteria: Record<string, any>): this {
+        if (this.traversals.length === 0) {
+          this.initialFilters = { ...this.initialFilters, ...criteria };
+        } else {
+          this.terminalFilters = { ...this.terminalFilters, ...criteria };
+        }
+        return this;
+      }
+
+      /**
+       * Perform a Vector Similarity Search (HNSW).
+       * This effectively sorts the start nodes by distance to the query vector.
+       */
+      nearText(vector: number[], options: { limit?: number } = {}): this {
+        this.vectorSearch = { 
+          vector, 
+          limit: options.limit || 10 
+        };
+        return this;
+      }
+
+      out(edgeType: string): this {
+        this.traversals.push({ type: 'out', edge: edgeType });
+        return this;
+      }
+
+      /**
+       * Filter the nodes at the end of the traversal by label.
+       */
+      node(labels: string[]): this {
+        this.endLabels = labels;
+        return this;
+      }
+
+      /**
+       * Helper to construct the temporal validity clause
+       */
+      private getTemporalClause(tableAlias: string = ''): string {
+        const prefix = tableAlias ? `${tableAlias}.` : '';
+        if (this.graph.context.asOf) {
+          // Time Travel: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+          // Interpolate strict ISO string
+          const iso = this.graph.context.asOf.toISOString();
+          // DuckDB TIMESTAMP comparison works with ISO strings
+          return `(${prefix}valid_from <= '${iso}' AND (${prefix}valid_to > '${iso}' OR ${prefix}valid_to IS NULL))`;
+        }
+        // Default: Current valid records (valid_to is NULL)
+        return `${prefix}valid_to IS NULL`;
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: Generic result mapper
+      async select<T = any>(mapper?: (node: any) => T): Promise<T[]> {
+        // --- Step 1: DuckDB Filter (Bottom Bun) ---
+        // Objective: Get a list of "Active" Node IDs to feed into the graph.
+
+        let query = `SELECT id FROM nodes`;
+        // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+        const params: any[] = [];
+        const conditions: string[] = [];
+
+        // 1.a Temporal Filter
+        conditions.push(this.getTemporalClause());
+
+        // 1.b Label Filter
+        if (this.startLabels.length > 0) {
+          // Check if ANY of the labels match. For V1 we check the first one or intersection.
+          conditions.push(`list_contains(labels, ?)`);
+          params.push(this.startLabels[0]);
+        }
+
+        // 1.c Property Filter
+        for (const [key, value] of Object.entries(this.initialFilters)) {
+          conditions.push(`json_extract(properties, '$.${key}') = ?`);
+          params.push(value);
+        }
+
+        // 1.d Vector Search (Order By Distance)
+        let orderBy = '';
+        let limit = '';
+        if (this.vectorSearch) {
+          if (!this.graph.capabilities.vss) {
+            throw new Error("Vector Search (nearText) requires the 'vss' DuckDB extension, which failed to load.");
+          }
+          // Requires: array_distance(embedding, [1,2,3])
+          // DuckDB VSS extension syntax
+          const vectorStr = `[${this.vectorSearch.vector.join(',')}]`; // Inline vector for V1
+          orderBy = `ORDER BY array_distance(embedding, ${vectorStr}::FLOAT[${this.vectorSearch.vector.length}])`;
+          limit = `LIMIT ${this.vectorSearch.limit}`;
+        }
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` ${orderBy} ${limit}`;
+
+        const startRows = await this.graph.db.query(query, params);
+        let currentIds: string[] = startRows.map(row => row.id);
+
+        if (currentIds.length === 0) return [];
+
+        // --- Step 2: Rust Traversal (The Meat) ---
+        // Note: Rust Graph Index is currently "Latest Topology Only". 
+        // Time Travel on topology requires checking edge validity during traversal (V2).
+        // For V1, we accept that traversal is instant/current, but properties are historical.
+
+        for (const step of this.traversals) {
+          if (currentIds.length === 0) break;
+          // step.type is 'out' | 'in'
+          // native.traverse(ids, edgeType, direction)
+          currentIds = this.graph.native.traverse(currentIds, step.edge, step.type);
+        }
+
+        // Optimization: If traversal resulted in no nodes, stop early.
+        if (currentIds.length === 0) return [];
+
+        // --- Step 3: DuckDB Hydration (Top Bun) ---
+        // Objective: Fetch full properties for the resulting IDs, applying terminal filters.
+
+        const finalConditions: string[] = [];
+        // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+        const finalParams: any[] = [];
+
+        // 3.0 Label Filter (for End Nodes)
+        if (this.endLabels.length > 0) {
+          finalConditions.push(`list_contains(labels, ?)`);
+          finalParams.push(this.endLabels[0]);
+        }
+
+        // 3.a IDs match
+        // We can't use parameters for IN clause effectively with dynamic length in all drivers.
+        // Constructing placeholders.
+        const placeholders = currentIds.map(() => '?').join(',');
+        finalConditions.push(`id IN (${placeholders})`);
+        finalParams.push(...currentIds);
+
+        // 3.b Temporal Validity
+        finalConditions.push(this.getTemporalClause());
+
+        // 3.c Terminal Property Filters
+        for (const [key, value] of Object.entries(this.terminalFilters)) {
+          finalConditions.push(`json_extract(properties, '$.${key}') = ?`);
+          finalParams.push(value);
+        }
+
+        const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join(' AND ')}`;
+        const results = await this.graph.db.query(finalSql, finalParams);
+
+        return results.map(r => {
+          let props = r.properties;
+          if (typeof props === 'string') {
+            try { props = JSON.parse(props); } catch {}
+          }
+          const node = {
+            id: r.id,
+            labels: r.labels,
+            ...props
+          };
+          return mapper ? mapper(node) : node;
+        });
+      }
+    }
+  crates/quack_core/src/topology.rs: |-
+    use crate::interner::Interner;
+    use bitvec::prelude::*;
+    use std::collections::HashMap;
+    use serde::{Serialize, Deserialize};
+    use std::fs::File;
+    use std::io::{BufReader, BufWriter};
+    use arrow::record_batch::RecordBatch;
+    use arrow::array::{AsArray, Array, StringArray, LargeStringArray};
+    use arrow::datatypes::DataType;
+
+    /// The core Graph Index.
+    /// Stores topology in RAM using integer IDs.
+    #[derive(Default, Debug, Serialize, Deserialize)]
+    pub struct GraphIndex {
+        node_interner: Interner,
+        
+        // Mapping edge type strings (e.g. "KNOWS") to u8 for compact storage.
+        // Limit: 256 edge types per graph in V1.
+        edge_type_map: HashMap<String, u8>,
+        edge_type_vec: Vec<String>,
+
+        // Forward Graph: Source Node ID -> List of (Target Node ID, Edge Type ID)
+        outgoing: Vec<Vec<(u32, u8)>>,
+        
+        // Reverse Graph: Target Node ID -> List of (Source Node ID, Edge Type ID)
+        incoming: Vec<Vec<(u32, u8)>>,
+
+        // Bitmask for soft-deleted nodes.
+        // true = deleted (tombstone), false = active.
+        tombstones: BitVec,
+    }
+
+    pub enum Direction {
+        Outgoing,
+        Incoming,
+    }
+
+    impl GraphIndex {
+        pub fn new() -> Self {
+            Self {
+                node_interner: Interner::new(),
+                edge_type_map: HashMap::new(),
+                edge_type_vec: Vec::new(),
+                outgoing: Vec::new(),
+                incoming: Vec::new(),
+                tombstones: BitVec::new(),
+            }
+        }
+
+        /// Compacts internal vectors to minimize memory usage.
+        /// Should be called after bulk hydration.
+        pub fn compact(&mut self) {
+            self.outgoing.shrink_to_fit();
+            self.outgoing.iter_mut().for_each(|v| v.shrink_to_fit());
+            self.incoming.shrink_to_fit();
+            self.incoming.iter_mut().for_each(|v| v.shrink_to_fit());
+            self.edge_type_vec.shrink_to_fit();
+        }
+
+        /// Resolves or creates an internal u32 ID for a node string.
+        /// Resizes internal storage if necessary.
+        pub fn get_or_create_node(&mut self, id: &str) -> u32 {
+            let internal_id = self.node_interner.intern(id);
+            let idx = internal_id as usize;
+
+            // Ensure vectors are large enough to hold this node
+            if idx >= self.outgoing.len() {
+                let new_len = idx + 1;
+                self.outgoing.resize_with(new_len, Vec::new);
+                self.incoming.resize_with(new_len, Vec::new);
+                // Resize tombstones, filling new slots with false (active)
+                self.tombstones.resize(new_len, false);
+            }
+            internal_id
+        }
+
+        /// Marks a node as deleted (soft delete).
+        /// Traversals will skip this node.
+        pub fn remove_node(&mut self, id: &str) {
+            if let Some(u_id) = self.node_interner.lookup_id(id) {
+                let idx = u_id as usize;
+                if idx < self.tombstones.len() {
+                    self.tombstones.set(idx, true);
+                }
+            }
+        }
+
+        /// Returns the total number of edges in the graph.
+        pub fn edge_count(&self) -> usize {
+            self.outgoing.iter().map(|edges| edges.len()).sum()
+        }
+
+        /// Resolves or creates a u8 ID for an edge type string.
+        /// Panics if more than 255 edge types are used (V1 constraint).
+        pub fn get_or_create_type(&mut self, type_name: &str) -> u8 {
+            if let Some(&id) = self.edge_type_map.get(type_name) {
+                return id;
+            }
+            let id = self.edge_type_vec.len();
+            if id > 255 {
+                panic!("QuackGraph V1 Limit: Max 256 unique edge types supported.");
+            }
+            let id_u8 = id as u8;
+            self.edge_type_vec.push(type_name.to_string());
+            self.edge_type_map.insert(type_name.to_string(), id_u8);
+            id_u8
+        }
+
+        /// Adds an edge to the graph. 
+        /// Idempotent: Does not add duplicate edges if they already exist.
+        pub fn add_edge(&mut self, source: &str, target: &str, edge_type: &str) {
+            let u_src = self.get_or_create_node(source);
+            let u_tgt = self.get_or_create_node(target);
+            let u_type = self.get_or_create_type(edge_type);
+
+            // Add to forward index (Idempotent)
+            let out_vec = &mut self.outgoing[u_src as usize];
+            if !out_vec.contains(&(u_tgt, u_type)) {
+                out_vec.push((u_tgt, u_type));
+            }
+            
+            // Add to reverse index (Idempotent)
+            let in_vec = &mut self.incoming[u_tgt as usize];
+            if !in_vec.contains(&(u_src, u_type)) {
+                in_vec.push((u_src, u_type));
+            }
+
+            // Ensure nodes are not tombstoned if they are being re-added/linked
+            if self.tombstones.get(u_src as usize).as_deref() == Some(&true) {
+                self.tombstones.set(u_src as usize, false);
+            }
+            if self.tombstones.get(u_tgt as usize).as_deref() == Some(&true) {
+                self.tombstones.set(u_tgt as usize, false);
+            }
+        }
+
+        /// Removes a specific edge from the graph.
+        /// Uses swap_remove for O(1) removal, order is not preserved.
+        pub fn remove_edge(&mut self, source: &str, target: &str, edge_type: &str) {
+            // We only proceed if all entities exist in our interner/maps
+            if let (Some(u_src), Some(u_tgt), Some(u_type)) = (
+                self.node_interner.lookup_id(source),
+                self.node_interner.lookup_id(target),
+                self.edge_type_map.get(edge_type).copied(),
+            ) {
+                // Remove from outgoing
+                if let Some(edges) = self.outgoing.get_mut(u_src as usize) {
+                    if let Some(pos) = edges.iter().position(|x| *x == (u_tgt, u_type)) {
+                        edges.swap_remove(pos);
+                    }
+                }
+                // Remove from incoming
+                if let Some(edges) = self.incoming.get_mut(u_tgt as usize) {
+                    if let Some(pos) = edges.iter().position(|x| *x == (u_src, u_type)) {
+                        edges.swap_remove(pos);
+                    }
+                }
+            }
+        }
+
+        /// Ingests an Apache Arrow RecordBatch directly.
+        /// Expected Schema: Columns named "source", "target", "type" (case-insensitive or exact).
+        pub fn add_arrow_batch(&mut self, batch: &RecordBatch) -> Result<(), String> {
+            let schema = batch.schema();
+            
+            // Resolve column indices by name for robustness (Case-Insensitive)
+            let find_col = |name: &str| -> Result<usize, String> {
+                schema.fields().iter().position(|f| f.name().eq_ignore_ascii_case(name))
+                    .ok_or_else(|| format!("Column '{}' not found in Arrow Batch. Available: {:?}", name, schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()))
+            };
+
+            let src_idx = find_col("source")?;
+            let tgt_idx = find_col("target")?;
+            let type_idx = find_col("type")?;
+
+            let num_rows = batch.num_rows();
+            if num_rows == 0 {
+                return Ok(());
+            }
+
+            // Wrapper to handle different string array types (Utf8 vs LargeUtf8)
+            enum StringArrayWrapper<'a> {
+                Small(&'a StringArray),
+                Large(&'a LargeStringArray),
+            }
+
+            impl<'a> StringArrayWrapper<'a> {
+                fn value(&self, i: usize) -> &'a str {
+                    match self {
+                        Self::Small(arr) => arr.value(i),
+                        Self::Large(arr) => arr.value(i),
+                    }
+                }
+            }
+
+            macro_rules! get_wrapper {
+                ($col:expr, $name:expr) => {
+                    match $col.data_type() {
+                        DataType::Utf8 => StringArrayWrapper::Small($col.as_string::<i32>()),
+                        DataType::LargeUtf8 => StringArrayWrapper::Large($col.as_string::<i64>()),
+                        dt => return Err(format!("{} column: Unsupported type {:?}", $name, dt)),
+                    }
+                }
+            }
+
+            let src_wrapper = get_wrapper!(batch.column(src_idx), "Source");
+            let tgt_wrapper = get_wrapper!(batch.column(tgt_idx), "Target");
+            let type_wrapper = get_wrapper!(batch.column(type_idx), "Type");
+
+            for i in 0..num_rows {
+                self.add_edge(src_wrapper.value(i), tgt_wrapper.value(i), type_wrapper.value(i));
+            }
+            Ok(())
+        }
+
+        /// Generic traversal step (Bidirectional).
+        /// Given a list of source node IDs (strings), find all neighbors connected by `edge_type`
+        /// in the specified `direction`.
+        pub fn traverse(&self, sources: &[String], edge_type: Option<&str>, direction: Direction) -> Vec<String> {
+            let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
+            
+            let mut result_ids: Vec<u32> = Vec::with_capacity(sources.len() * 2);
+            
+            let adjacency = match direction {
+                Direction::Outgoing => &self.outgoing,
+                Direction::Incoming => &self.incoming,
+            };
+
+            for src_str in sources {
+                // If source node doesn't exist in our index, skip it
+                if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                    // Check if node is deleted
+                    if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                        continue;
+                    }
+
+                    if let Some(edges) = adjacency.get(src_id as usize) {
+                        for &(target, type_id) in edges {
+                            // Apply edge type filter if present
+                            if let Some(req_type) = type_filter {
+                                if req_type != type_id {
+                                    continue;
+                                }
+                            }
+                            // Check if target is deleted
+                            if self.tombstones.get(target as usize).as_deref() == Some(&true) {
+                                continue;
+                            }
+                            result_ids.push(target);
+                        }
+                    }
+                }
+            }
+
+            // Deduplicate results
+            result_ids.sort_unstable();
+            result_ids.dedup();
+
+            // Convert back to strings
+            result_ids
+                .into_iter()
+                .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
+                .collect()
+        }
+
+        pub fn node_count(&self) -> usize {
+            self.node_interner.len()
+        }
+
+        /// Serializes the entire graph topology to a binary file.
+        pub fn save_to_file(&self, path: &str) -> Result<(), String> {
+            let file = File::create(path).map_err(|e| e.to_string())?;
+            let writer = BufWriter::new(file);
+            bincode::serialize_into(writer, self).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// Deserializes the graph topology from a binary file.
+        pub fn load_from_file(path: &str) -> Result<Self, String> {
+            let file = File::open(path).map_err(|e| e.to_string())?;
+            let reader = BufReader::new(file);
+            bincode::deserialize_from(reader).map_err(|e| e.to_string())
+        }
+    }
+approved: true
+linesAdded: 30
+linesRemoved: 14
+linesDifference: 44
+gitCommittedAt: '2025-12-02T10:40:48.526Z'
+status: committed
+id: 27

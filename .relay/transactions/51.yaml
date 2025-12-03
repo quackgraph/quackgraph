@@ -1,0 +1,549 @@
+uuid: ec44e78a-5309-40c0-96da-679901170d44
+projectId: quackgraph
+createdAt: '2025-12-02T14:33:41.006Z'
+gitCommitMsg: >-
+  fix: explicitly bind native methods and cast vector search types
+
+  - Add #[napi(js_name)] to match_pattern and traverse_recursive to ensure
+  correct JS exposure. - Add explicit ::FLOAT[] casts to array_distance inputs
+  in query builder to resolve DuckDB Binder Error.
+promptSummary: >-
+  Fix Native binding methods missing (matchPattern, traverseRecursive) and fix
+  RAG Vector Search type casting error.
+reasoning:
+  - >-
+    To resolve the test failures, I will patch `packages/native/src/lib.rs` to
+    explicitly expose the native methods with the correct JavaScript names using
+    `#[napi(js_name = "...")]`. This ensures `matchPattern` and
+    `traverseRecursive` are correctly bound regardless of default snake_case to
+    camelCase conversion rules or build artifacts.
+  - >-
+    I will also patch `packages/quack-graph/src/query.ts` to add explicit type
+    casts to the Vector Search query. The error `Binder Error: No function
+    matches ... array_distance(FLOAT[], FLOAT[])` with candidates
+    `array_distance(FLOAT[ANY], FLOAT[ANY])` suggests a type ambiguity that can
+    be resolved by casting both arguments to `FLOAT[]`.
+  - '### Changes'
+  - >-
+    1.  **packages/native/src/lib.rs**: Added `js_name` attributes to
+    `traverse_recursive` and `match_pattern`.
+  - >-
+    2.  **packages/quack-graph/src/query.ts**: Added explicit `::FLOAT[]` casts
+    to `array_distance` arguments.
+operations:
+  - type: write
+    path: packages/native/src/lib.rs
+    content: |
+      --- packages/native/src/lib.rs
+      +++ packages/native/src/lib.rs
+      @@ -82,7 +82,7 @@
+       
+           /// Performs a recursive traversal (BFS) with depth bounds.
+           /// Returns unique node IDs reachable within [min_depth, max_depth].
+      -    #[napi]
+      +    #[napi(js_name = "traverseRecursive")]
+           pub fn traverse_recursive(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>, min_depth: Option<u32>, max_depth: Option<u32>) -> Vec<String> {
+               let dir = match direction.as_deref() {
+                   Some("in") | Some("IN") => Direction::Incoming,
+      @@ -99,7 +99,7 @@
+           /// Finds subgraphs matching the given pattern.
+           /// `start_ids` maps to variable 0 in the pattern.
+      -    #[napi]
+      +    #[napi(js_name = "matchPattern")]
+           pub fn match_pattern(&self, start_ids: Vec<String>, pattern: Vec<JsPatternEdge>) -> Vec<Vec<String>> {
+               let mut core_pattern = Vec::with_capacity(pattern.len());
+               for p in pattern {
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/query.ts
+    content: >
+      --- packages/quack-graph/src/query.ts
+
+      +++ packages/quack-graph/src/query.ts
+
+      @@ -165,7 +165,7 @@
+             // DuckDB VSS extension syntax
+             const vectorStr = `[${this.vectorSearch.vector.join(',')}]`; // Inline vector for V1
+      -      orderBy = `ORDER BY array_distance(embedding,
+      ${vectorStr}::FLOAT[])`;
+
+      +      orderBy = `ORDER BY array_distance(embedding::FLOAT[],
+      ${vectorStr}::FLOAT[])`;
+             limit = `LIMIT ${this.vectorSearch.limit}`;
+           }
+    patchStrategy: standard-diff
+snapshot:
+  packages/native/src/lib.rs: |-
+    #![deny(clippy::all)]
+
+    use napi::bindgen_prelude::*;
+    use napi_derive::napi;
+    use quack_core::{matcher::{Matcher, PatternEdge}, GraphIndex, Direction};
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    #[napi]
+    pub struct NativeGraph {
+        inner: GraphIndex,
+    }
+
+    #[napi(object)]
+    pub struct JsPatternEdge {
+        pub src_var: u32,
+        pub tgt_var: u32,
+        pub edge_type: String,
+        pub direction: Option<String>,
+    }
+    #[napi]
+    impl NativeGraph {
+        #[napi(constructor)]
+        pub fn new() -> Self {
+            Self {
+                inner: GraphIndex::new(),
+            }
+        }
+
+        #[napi]
+        pub fn add_node(&mut self, id: String) {
+            self.inner.get_or_create_node(&id);
+        }
+
+        /// Hydrates the graph from an Arrow IPC stream (Buffer).
+        /// Zero-copy (mostly) data transfer from DuckDB.
+        #[napi]
+        pub fn load_arrow_ipc(&mut self, buffer: Buffer) -> napi::Result<()> {
+            let cursor = Cursor::new(buffer.as_ref());
+            let reader = StreamReader::try_new(cursor, None).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+            for batch in reader {
+                let batch = batch.map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                self.inner.add_arrow_batch(&batch).map_err(napi::Error::from_reason)?;
+            }
+            Ok(())
+        }
+
+        /// Compacts the graph's memory usage.
+        /// Call this after hydration to reclaim unused capacity in the adjacency lists.
+        #[napi]
+        pub fn compact(&mut self) {
+            self.inner.compact();
+        }
+
+        #[napi]
+        pub fn add_edge(&mut self, source: String, target: String, edge_type: String) {
+            self.inner.add_edge(&source, &target, &edge_type);
+        }
+
+        #[napi]
+        pub fn remove_node(&mut self, id: String) {
+            self.inner.remove_node(&id);
+        }
+
+        #[napi]
+        pub fn remove_edge(&mut self, source: String, target: String, edge_type: String) {
+            self.inner.remove_edge(&source, &target, &edge_type);
+        }
+
+        /// Performs a single-hop traversal (bfs-step).
+        /// Returns unique neighbor IDs.
+        #[napi]
+        pub fn traverse(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>) -> Vec<String> {
+            let dir = match direction.as_deref() {
+                Some("in") | Some("IN") => Direction::Incoming,
+                _ => Direction::Outgoing,
+            };
+            self.inner.traverse(&sources, edge_type.as_deref(), dir)
+        }
+
+        /// Performs a recursive traversal (BFS) with depth bounds.
+        /// Returns unique node IDs reachable within [min_depth, max_depth].
+        #[napi]
+        pub fn traverse_recursive(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>, min_depth: Option<u32>, max_depth: Option<u32>) -> Vec<String> {
+            let dir = match direction.as_deref() {
+                Some("in") | Some("IN") => Direction::Incoming,
+                _ => Direction::Outgoing,
+            };
+            
+            let min = min_depth.unwrap_or(1) as usize;
+            let max = max_depth.unwrap_or(1) as usize;
+            
+            self.inner.traverse_recursive(&sources, edge_type.as_deref(), dir, min, max)
+        }
+
+        /// Finds subgraphs matching the given pattern.
+        /// `start_ids` maps to variable 0 in the pattern.
+        #[napi]
+        pub fn match_pattern(&self, start_ids: Vec<String>, pattern: Vec<JsPatternEdge>) -> Vec<Vec<String>> {
+            let mut core_pattern = Vec::with_capacity(pattern.len());
+            for p in pattern {
+                if let Some(type_id) = self.inner.get_type_id(&p.edge_type) {
+                    core_pattern.push(PatternEdge {
+                        src_var: p.src_var as usize,
+                        tgt_var: p.tgt_var as usize,
+                        type_id,
+                        direction: match p.direction.as_deref() {
+                            Some("in") | Some("IN") => Direction::Incoming,
+                            _ => Direction::Outgoing,
+                        },
+                    });
+                } else {
+                    return Vec::new(); // Edge type doesn't exist, no matches possible.
+                }
+            }
+
+            let start_candidates: Vec<u32> = start_ids.iter()
+                .filter_map(|id| self.inner.lookup_id(id))
+                .collect();
+
+            if start_candidates.is_empty() {
+                return Vec::new();
+            }
+
+            let matcher = Matcher::new(&self.inner, &core_pattern);
+            let raw_results = matcher.find_matches(&start_candidates);
+
+            raw_results.into_iter().map(|row| {
+                row.into_iter().filter_map(|uid| self.inner.lookup_str(uid).map(|s| s.to_string())).collect()
+            }).collect()
+        }
+
+        /// Returns the number of nodes in the interned index.
+        /// Useful for debugging hydration.
+        #[napi(getter)]
+        pub fn node_count(&self) -> u32 {
+            // We cast to u32 because exposing usize to JS can be finicky depending on napi version,
+            // though napi usually handles numbers well. Safe for V1.
+            self.inner.node_count() as u32
+        }
+
+        #[napi(getter)]
+        pub fn edge_count(&self) -> u32 {
+            self.inner.edge_count() as u32
+        }
+
+        #[napi]
+        pub fn save_snapshot(&self, path: String) -> napi::Result<()> {
+            self.inner.save_to_file(&path).map_err(napi::Error::from_reason)
+        }
+
+        #[napi]
+        pub fn load_snapshot(&mut self, path: String) -> napi::Result<()> {
+            let loaded = GraphIndex::load_from_file(&path).map_err(napi::Error::from_reason)?;
+            self.inner = loaded;
+            Ok(())
+        }
+    }
+
+    impl Default for NativeGraph {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+  packages/quack-graph/src/query.ts: |-
+    import type { QuackGraph } from './graph';
+
+    type TraversalStep = {
+      type: 'out' | 'in' | 'recursive';
+      edge: string;
+      direction?: 'out' | 'in';
+      bounds?: { min: number; max: number };
+    };
+
+    export class QueryBuilder {
+      private graph: QuackGraph;
+      private startLabels: string[];
+      private endLabels: string[] = [];
+
+      // Bottom Bun Filters (Initial selection)
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      private initialFilters: Record<string, any> = {};
+      private vectorSearch: { vector: number[]; limit: number } | null = null;
+
+      // The Meat (Traversal)
+      private traversals: TraversalStep[] = [];
+
+      // Top Bun Filters (Final selection)
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      private terminalFilters: Record<string, any> = {};
+
+      private aggState = {
+        groupBy: [] as string[],
+        orderBy: [] as { field: string; dir: 'ASC' | 'DESC' }[],
+        limit: undefined as number | undefined,
+        offset: undefined as number | undefined,
+      };
+
+      constructor(graph: QuackGraph, labels: string[]) {
+        this.graph = graph;
+        this.startLabels = labels;
+      }
+
+      /**
+       * Traverses the graph recursively (BFS) with depth bounds.
+       * Useful for variable length paths like `(a)-[:KNOWS*1..5]->(b)`.
+       * @param edgeType The edge label to follow.
+       * @param options min/max depth (default: 1..5).
+       * @param direction 'out' (default) or 'in'.
+       */
+      recursive(edgeType: string, options: { min?: number; max?: number } = {}, direction: 'out' | 'in' = 'out'): this {
+        this.traversals.push({
+          type: 'recursive',
+          edge: edgeType,
+          direction,
+          bounds: {
+            min: options.min ?? 1,
+            max: options.max ?? 5,
+          }
+        });
+        return this;
+      }
+
+      /**
+       * Filter nodes by properties.
+       * If called before traversal, applies to Start Nodes.
+       * If called after traversal, applies to End Nodes.
+       */
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      where(criteria: Record<string, any>): this {
+        if (this.traversals.length === 0) {
+          this.initialFilters = { ...this.initialFilters, ...criteria };
+        } else {
+          this.terminalFilters = { ...this.terminalFilters, ...criteria };
+        }
+        return this;
+      }
+
+      /**
+       * Perform a Vector Similarity Search (HNSW).
+       * This effectively sorts the start nodes by distance to the query vector.
+       */
+      nearText(vector: number[], options: { limit?: number } = {}): this {
+        this.vectorSearch = { 
+          vector, 
+          limit: options.limit || 10 
+        };
+        return this;
+      }
+
+      out(edgeType: string): this {
+        this.traversals.push({ type: 'out', edge: edgeType });
+        return this;
+      }
+
+      in(edgeType: string): this {
+        this.traversals.push({ type: 'in', edge: edgeType });
+        return this;
+      }
+
+      groupBy(field: string): this {
+        this.aggState.groupBy.push(field);
+        return this;
+      }
+
+      orderBy(field: string, dir: 'ASC' | 'DESC' = 'ASC'): this {
+        this.aggState.orderBy.push({ field, dir });
+        return this;
+      }
+
+      limit(n: number): this {
+        this.aggState.limit = n;
+        return this;
+      }
+
+      offset(n: number): this {
+        this.aggState.offset = n;
+        return this;
+      }
+
+      /**
+       * Filter the nodes at the end of the traversal by label.
+       */
+      node(labels: string[]): this {
+        this.endLabels = labels;
+        return this;
+      }
+
+      /**
+       * Helper to construct the temporal validity clause
+       */
+      private getTemporalClause(tableAlias: string = ''): string {
+        const prefix = tableAlias ? `${tableAlias}.` : '';
+        if (this.graph.context.asOf) {
+          // Time Travel: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+          // Interpolate strict ISO string
+          const iso = this.graph.context.asOf.toISOString();
+          // DuckDB TIMESTAMP comparison works with ISO strings
+          return `(${prefix}valid_from <= '${iso}' AND (${prefix}valid_to > '${iso}' OR ${prefix}valid_to IS NULL))`;
+        }
+        // Default: Current valid records (valid_to is NULL)
+        return `${prefix}valid_to IS NULL`;
+      }
+
+      /**
+       * Executes the query.
+       * @param projection Optional SQL projection string (e.g., 'count(*), avg(properties->>age)') or a JS mapper function.
+       */
+      // biome-ignore lint/suspicious/noExplicitAny: Generic result mapper
+      async select<T = any>(projection?: string | ((node: any) => T)): Promise<T[]> {
+        const isRawSql = typeof projection === 'string';
+        const mapper = typeof projection === 'function' ? projection : undefined;
+
+        // --- Step 1: DuckDB Filter (Bottom Bun) ---
+        // Objective: Get a list of "Active" Node IDs to feed into the graph.
+
+        let query = `SELECT id FROM nodes`;
+        // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+        const params: any[] = [];
+        const conditions: string[] = [];
+
+        // 1.a Temporal Filter
+        conditions.push(this.getTemporalClause());
+
+        // 1.b Label Filter
+        if (this.startLabels.length > 0) {
+          // Check if ANY of the labels match. For V1 we check the first one or intersection.
+          conditions.push(`list_contains(labels, ?)`);
+          params.push(this.startLabels[0]);
+        }
+
+        // 1.c Property Filter
+        for (const [key, value] of Object.entries(this.initialFilters)) {
+          if (key === 'id') {
+            conditions.push(`id = ?`);
+            params.push(value);
+          } else {
+            conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+            params.push(JSON.stringify(value));
+          }
+        }
+
+        // 1.d Vector Search (Order By Distance)
+        let orderBy = '';
+        let limit = '';
+        if (this.vectorSearch) {
+          // Requires: array_distance(embedding, [1,2,3])
+          // DuckDB VSS extension syntax
+          const vectorStr = `[${this.vectorSearch.vector.join(',')}]`; // Inline vector for V1
+          orderBy = `ORDER BY array_distance(embedding, ${vectorStr}::FLOAT[])`;
+          limit = `LIMIT ${this.vectorSearch.limit}`;
+        }
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` ${orderBy} ${limit}`;
+
+        const startRows = await this.graph.db.query(query, params);
+        let currentIds: string[] = startRows.map(row => row.id);
+
+        if (currentIds.length === 0) return [];
+
+        // --- Step 2: Rust Traversal (The Meat) ---
+        // Note: Rust Graph Index is currently "Latest Topology Only". 
+        // Time Travel on topology requires checking edge validity during traversal (V2).
+        // For V1, we accept that traversal is instant/current, but properties are historical.
+
+        for (const step of this.traversals) {
+          if (currentIds.length === 0) break;
+          
+          if (step.type === 'recursive') {
+            currentIds = this.graph.native.traverseRecursive(
+              currentIds,
+              step.edge,
+              step.direction || 'out',
+              step.bounds?.min,
+              step.bounds?.max
+            );
+          } else {
+            // step.type is 'out' | 'in'
+            currentIds = this.graph.native.traverse(currentIds, step.edge, step.type as 'out' | 'in');
+          }
+        }
+
+        // Optimization: If traversal resulted in no nodes, stop early.
+        if (currentIds.length === 0) return [];
+
+        // --- Step 3: DuckDB Hydration (Top Bun) ---
+        // Objective: Fetch full properties for the resulting IDs, applying terminal filters.
+
+        const finalConditions: string[] = [];
+        // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+        const finalParams: any[] = [];
+
+        // 3.0 Label Filter (for End Nodes)
+        if (this.endLabels.length > 0) {
+          finalConditions.push(`list_contains(labels, ?)`);
+          finalParams.push(this.endLabels[0]);
+        }
+
+        // 3.a IDs match
+        // We can't use parameters for IN clause effectively with dynamic length in all drivers.
+        // Constructing placeholders.
+        const placeholders = currentIds.map(() => '?').join(',');
+        finalConditions.push(`id IN (${placeholders})`);
+        finalParams.push(...currentIds);
+
+        // 3.b Temporal Validity
+        finalConditions.push(this.getTemporalClause());
+
+        // 3.c Terminal Property Filters
+        for (const [key, value] of Object.entries(this.terminalFilters)) {
+          if (key === 'id') {
+            finalConditions.push(`id = ?`);
+            finalParams.push(value);
+          } else {
+            finalConditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+            finalParams.push(JSON.stringify(value));
+          }
+        }
+
+        // 3.d Aggregation / Grouping / Ordering
+        let selectClause = 'SELECT *';
+        if (isRawSql) {
+          selectClause = `SELECT ${projection}`;
+        }
+
+        let suffix = '';
+        if (this.aggState.groupBy.length > 0) {
+          suffix += ` GROUP BY ${this.aggState.groupBy.join(', ')}`;
+        }
+        
+        if (this.aggState.orderBy.length > 0) {
+          const orders = this.aggState.orderBy.map(o => `${o.field} ${o.dir}`).join(', ');
+          suffix += ` ORDER BY ${orders}`;
+        }
+
+        if (this.aggState.limit !== undefined) {
+          suffix += ` LIMIT ${this.aggState.limit}`;
+        }
+        if (this.aggState.offset !== undefined) {
+          suffix += ` OFFSET ${this.aggState.offset}`;
+        }
+
+        const finalSql = `${selectClause} FROM nodes WHERE ${finalConditions.join(' AND ')} ${suffix}`;
+        const results = await this.graph.db.query(finalSql, finalParams);
+
+        return results.map(r => {
+          if (isRawSql) return r;
+
+          let props = r.properties;
+          if (typeof props === 'string') {
+            try { props = JSON.parse(props); } catch {}
+          }
+          const node = {
+            id: r.id,
+            labels: r.labels,
+            ...props
+          };
+          return mapper ? mapper(node) : node;
+        });
+      }
+    }
+approved: true
+linesAdded: 3
+linesRemoved: 3
+linesDifference: 6
+gitCommittedAt: '2025-12-02T14:35:55.164Z'
+status: committed
+id: 51

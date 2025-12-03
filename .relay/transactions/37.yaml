@@ -1,0 +1,94 @@
+uuid: 4a2b6c8d-1e3f-4a5b-9c7d-8e9f0a1b2c3d
+projectId: quackgraph
+createdAt: '2025-12-02T12:31:18.914Z'
+gitCommitMsg: 'fix(test): remove unused import in concurrency test'
+promptSummary: >-
+  Fixed a linting error by removing an unused import in the concurrency
+  integration test.
+reasoning:
+  - >-
+    The linting error indicates an unused import in
+    `test/integration/concurrency.test.ts`. I will remove it.
+operations:
+  - type: write
+    path: test/integration/concurrency.test.ts
+    content: |
+      --- test/integration/concurrency.test.ts
+      +++ test/integration/concurrency.test.ts
+      @@ -1,5 +1,4 @@
+       import { describe, test, expect, afterEach } from 'bun:test';
+       import { createGraph, cleanupGraph } from '../utils/helpers';
+      -import type { QuackGraph } from '../../packages/quack-graph/src/index';
+       
+       describe('Integration: Concurrency', () => {
+    patchStrategy: standard-diff
+snapshot:
+  test/integration/concurrency.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph } from '../utils/helpers';
+    import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('Integration: Concurrency', () => {
+      let path: string;
+
+      afterEach(async () => {
+        if (path) await cleanupGraph(path);
+      });
+
+      test('should handle concurrent node additions without data loss', async () => {
+        const setup = await createGraph('disk', 'int-concurrency');
+        const g = setup.graph;
+        path = setup.path;
+
+        const count = 100;
+        const promises = [];
+
+        // Fire 100 writes "simultaneously"
+        for (let i = 0; i < count; i++) {
+          promises.push(g.addNode(`node:${i}`, ['Node'], { index: i }));
+        }
+
+        await Promise.all(promises);
+
+        expect(g.native.nodeCount).toBe(count);
+        
+        // Check DB persistence
+        const rows = await g.db.query('SELECT count(*) as c FROM nodes WHERE valid_to IS NULL');
+        const c = Number(rows[0].c); 
+        expect(c).toBe(count);
+      });
+
+      test('should handle concurrent edge additions between same nodes', async () => {
+        // Tests locking mechanism on adjacency list (if any) or vector resizing safety
+        const setup = await createGraph('disk', 'int-concurrency-edges');
+        const g = setup.graph;
+        path = setup.path;
+
+        await g.addNode('A', ['Node']);
+        await g.addNode('B', ['Node']);
+
+        const count = 50;
+        const promises = [];
+
+        // Add 50 edges "simultaneously" of DIFFERENT types to avoid idempotency masking the test
+        for (let i = 0; i < count; i++) {
+          promises.push(g.addEdge('A', 'B', `LINK_${i}`));
+        }
+
+        await Promise.all(promises);
+
+        expect(g.native.edgeCount).toBe(count);
+
+        // Verify traversal finds them all
+        // Checking one specific link
+        const neighbors = g.native.traverse(['A'], 'LINK_42', 'out');
+        expect(neighbors).toEqual(['B']);
+      });
+    });
+approved: true
+linesAdded: 0
+linesRemoved: 1
+linesDifference: 1
+gitCommittedAt: '2025-12-02T12:31:38.681Z'
+status: committed
+id: 37

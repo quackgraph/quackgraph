@@ -1,0 +1,396 @@
+uuid: a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d
+projectId: quackgraph
+createdAt: '2025-12-02T12:29:54.820Z'
+gitCommitMsg: >-
+  test: add extensive e2e and integration suites
+
+  Adds supply chain, RBAC, concurrency, and error handling tests to verify core
+  engine robustness and edge case handling.
+promptSummary: >-
+  Added comprehensive E2E and Integration tests covering concurrency, supply
+  chain logic, RBAC, complex queries, and edge cases to ensure production
+  readiness.
+reasoning:
+  - >-
+    This change adds comprehensive test suites covering End-to-End (E2E)
+    scenarios, Integration tests for concurrency and complex queries, and edge
+    case handling. These tests ensure the "Split-Brain" architecture (DuckDB +
+    Rust) behaves correctly under stress and complex logical conditions.
+  - >-
+    1.  **Supply Chain E2E**: Validates deep recursive logic and impact
+    analysis.
+  - '2.  **RBAC E2E**: Validates multiple hop existence checks for permissions.'
+  - >-
+    3.  **Concurrency Integration**: Validates thread safety and data integrity
+    during parallel writes.
+  - >-
+    4.  **Complex Query Integration**: Validates the "Sandwich" execution model
+    (Filter -> Traverse -> Filter).
+  - >-
+    5.  **Errors Integration**: Validates robustness against phantom nodes and
+    special characters.
+operations:
+  - type: write
+    path: test/e2e/supply-chain.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('E2E: Supply Chain Impact Analysis', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should identify all finished goods affected by a defective raw material', async () => {
+          // Scenario:
+          // Raw Material (Lithium) -> Component (Battery) -> Sub-Assembly (PowerPack) -> Product (EV Car)
+          //                                               -> Product (PowerWall)
+          // Raw Material (Steel)   -> Component (Chassis) -> Product (EV Car)
+          
+          const setup = await createGraph('disk', 'e2e-supply-chain');
+          g = setup.graph;
+          path = setup.path;
+
+          // 1. Ingest Data
+          await g.addNode('mat:lithium', ['Material'], { batch: 'BATCH-001' });
+          await g.addNode('mat:steel', ['Material']);
+          
+          await g.addNode('comp:battery', ['Component']);
+          await g.addNode('comp:chassis', ['Component']);
+          
+          await g.addNode('sub:powerpack', ['SubAssembly']);
+          
+          await g.addNode('prod:car', ['Product']);
+          await g.addNode('prod:wall', ['Product']);
+
+          // Flows
+          await g.addEdge('mat:lithium', 'comp:battery', 'PART_OF');
+          await g.addEdge('comp:battery', 'sub:powerpack', 'PART_OF');
+          await g.addEdge('sub:powerpack', 'prod:car', 'PART_OF');
+          await g.addEdge('sub:powerpack', 'prod:wall', 'PART_OF');
+          
+          await g.addEdge('mat:steel', 'comp:chassis', 'PART_OF');
+          await g.addEdge('comp:chassis', 'prod:car', 'PART_OF');
+
+          // 2. Query: The 'Lithium' batch is bad. Find all Products.
+          
+          // Depth 1: Battery
+          const depth1 = await g.match(['Material'])
+              .where({ id: 'mat:lithium' })
+              .out('PART_OF')
+              .select(n => n.id);
+          expect(depth1).toContain('comp:battery');
+
+          // Depth 2: Powerpack
+          const depth2 = await g.match(['Material'])
+              .where({ id: 'mat:lithium' })
+              .out('PART_OF')
+              .out('PART_OF')
+              .select(n => n.id);
+          expect(depth2).toContain('sub:powerpack');
+
+          // Depth 3: Products (Car, Wall)
+          const affectedProducts = await g.match(['Material'])
+              .where({ id: 'mat:lithium' })
+              .out('PART_OF') // Battery
+              .out('PART_OF') // Powerpack
+              .out('PART_OF') // Car, Wall
+              .node(['Product'])
+              .select(n => n.id);
+
+          expect(affectedProducts.length).toBe(2);
+          expect(affectedProducts).toContain('prod:car');
+          expect(affectedProducts).toContain('prod:wall');
+          
+          // Ensure Steel path didn't contaminate results (Steel -> Chassis -> Car)
+          // Our path started at Lithium, so it shouldn't pick up Chassis unless connected.
+          
+          const steelProducts = await g.match(['Material'])
+              .where({ id: 'mat:steel' })
+              .out('PART_OF') // Chassis
+              .out('PART_OF') // Car
+              .node(['Product'])
+              .select(n => n.id);
+              
+          expect(steelProducts).toEqual(['prod:car']);
+          expect(steelProducts).not.toContain('prod:wall');
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/e2e/access-control.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('E2E: RBAC (Access Control)', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should resolve nested group memberships to check permissions', async () => {
+          // User -> MEMBER_OF -> Group A -> MEMBER_OF -> Group B -> HAS_PERMISSION -> Resource
+          const setup = await createGraph('disk', 'e2e-rbac');
+          g = setup.graph;
+          path = setup.path;
+
+          await g.addNode('user:alice', ['User']);
+          await g.addNode('group:devs', ['Group']);
+          await g.addNode('group:admins', ['Group']);
+          await g.addNode('res:prod_db', ['Resource']);
+
+          // Alice is in Devs
+          await g.addEdge('user:alice', 'group:devs', 'MEMBER_OF');
+          // Devs is a subset of Admins (Nested Group)
+          await g.addEdge('group:devs', 'group:admins', 'MEMBER_OF');
+          // Admins have access to Prod DB
+          await g.addEdge('group:admins', 'res:prod_db', 'CAN_ACCESS');
+
+          // Query: Can Alice access prod_db?
+          
+          // 1 hop check (Direct access?)
+          const direct = await g.match(['User'])
+              .where({ id: 'user:alice' })
+              .out('CAN_ACCESS')
+              .select(r => r.id);
+          expect(direct).toEqual([]);
+
+          // 2 hop check (Group access)
+          const groupAccess = await g.match(['User'])
+              .where({ id: 'user:alice' })
+              .out('MEMBER_OF')
+              .out('CAN_ACCESS')
+              .select(r => r.id);
+          // Alice -> Devs -x-> ? (Devs don't have direct access)
+          expect(groupAccess).toEqual([]);
+
+          // 3 hop check (Nested Group access)
+          const nestedAccess = await g.match(['User'])
+              .where({ id: 'user:alice' })
+              .out('MEMBER_OF') // Devs
+              .out('MEMBER_OF') // Admins
+              .out('CAN_ACCESS') // Prod DB
+              .select(r => r.id);
+          
+          expect(nestedAccess).toContain('res:prod_db');
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/integration/concurrency.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('Integration: Concurrency', () => {
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should handle concurrent node additions without data loss', async () => {
+          const setup = await createGraph('disk', 'int-concurrency');
+          const g = setup.graph;
+          path = setup.path;
+
+          const count = 100;
+          const promises = [];
+
+          // Fire 100 writes "simultaneously"
+          for (let i = 0; i < count; i++) {
+            promises.push(g.addNode(`node:${i}`, ['Node'], { index: i }));
+          }
+
+          await Promise.all(promises);
+
+          expect(g.native.nodeCount).toBe(count);
+          
+          // Check DB persistence
+          const rows = await g.db.query('SELECT count(*) as c FROM nodes WHERE valid_to IS NULL');
+          const c = Number(rows[0].c); 
+          expect(c).toBe(count);
+        });
+
+        test('should handle concurrent edge additions between same nodes', async () => {
+          // Tests locking mechanism on adjacency list (if any) or vector resizing safety
+          const setup = await createGraph('disk', 'int-concurrency-edges');
+          const g = setup.graph;
+          path = setup.path;
+
+          await g.addNode('A', ['Node']);
+          await g.addNode('B', ['Node']);
+
+          const count = 50;
+          const promises = [];
+
+          // Add 50 edges "simultaneously" of DIFFERENT types to avoid idempotency masking the test
+          for (let i = 0; i < count; i++) {
+            promises.push(g.addEdge('A', 'B', `LINK_${i}`));
+          }
+
+          await Promise.all(promises);
+
+          expect(g.native.edgeCount).toBe(count);
+
+          // Verify traversal finds them all
+          // Checking one specific link
+          const neighbors = g.native.traverse(['A'], 'LINK_42', 'out');
+          expect(neighbors).toEqual(['B']);
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/integration/complex-query.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('Integration: Complex Query Logic', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should support the "Sandwich" pattern: Filter -> Traverse -> Filter', async () => {
+          const setup = await createGraph('disk', 'int-complex-query');
+          g = setup.graph;
+          path = setup.path;
+
+          // Graph:
+          // User(Active) -> KNOWS -> User(Active, Age 20)
+          // User(Active) -> KNOWS -> User(Inactive, Age 20)
+          // User(Active) -> KNOWS -> User(Active, Age 50)
+
+          await g.addNode('start', ['User'], { status: 'active' });
+          
+          await g.addNode('u1', ['User'], { status: 'active', age: 20 });
+          await g.addNode('u2', ['User'], { status: 'inactive', age: 20 });
+          await g.addNode('u3', ['User'], { status: 'active', age: 50 });
+
+          await g.addEdge('start', 'u1', 'KNOWS');
+          await g.addEdge('start', 'u2', 'KNOWS');
+          await g.addEdge('start', 'u3', 'KNOWS');
+
+          // Query: Start node (status=active) -> KNOWS -> End node (status=active AND age=20)
+          const results = await g.match(['User'])
+              .where({ id: 'start', status: 'active' }) // Initial Filter
+              .out('KNOWS')                             // Traversal
+              .node(['User'])
+              .where({ status: 'active', age: 20 })     // Terminal Filter
+              .select(u => u.id);
+
+          expect(results.length).toBe(1);
+          expect(results[0]).toBe('u1');
+        });
+
+        test('should handle empty intermediate results gracefully', async () => {
+          const setup = await createGraph('disk', 'int-empty-query');
+          g = setup.graph;
+          path = setup.path;
+
+          await g.addNode('a', ['Node']);
+          
+          const results = await g.match(['Node'])
+              .where({ id: 'a' })
+              .out('MISSING_EDGE')
+              .out('ANOTHER_EDGE')
+              .select(n => n.id);
+
+          expect(results).toEqual([]);
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/integration/errors.test.ts
+    content: |-
+      import { describe, test, expect, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('Integration: Error Handling & Edge Cases', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        afterEach(async () => {
+          if (path) await cleanupGraph(path);
+        });
+
+        test('should allow edges to non-existent nodes (Graph Pattern Matching behavior)', async () => {
+          // QuackGraph V1 is schemaless. It allows adding edges to nodes that haven't been explicitly created.
+          // However, since those nodes don't exist in the 'nodes' table, they should be filtered out 
+          // during the final hydration (SELECT * FROM nodes) step of the query builder.
+          
+          const setup = await createGraph('disk', 'int-errors');
+          g = setup.graph;
+          path = setup.path;
+
+          await g.addNode('real_node', ['Node']);
+          // Edge to phantom node
+          await g.addEdge('real_node', 'phantom_node', 'LINK');
+
+          // 1. Native Traversal should find it (Topology exists)
+          const nativeNeighbors = g.native.traverse(['real_node'], 'LINK', 'out');
+          expect(nativeNeighbors).toContain('phantom_node');
+
+          // 2. Query Builder should NOT return it (Data missing)
+          const neighbors = await g.match(['Node'])
+              .where({ id: 'real_node' })
+              .out('LINK')
+              .select(n => n.id);
+
+          expect(neighbors.length).toBe(0); 
+        });
+
+        test('should handle special characters in IDs', async () => {
+          const setup = await createGraph('disk', 'int-special-chars');
+          g = setup.graph;
+          path = setup.path;
+
+          const crazyId = 'Node/With"Quotes\'And\\Backslashes 🦆';
+          await g.addNode(crazyId, ['Node']);
+          await g.addNode('b', ['Node']);
+          await g.addEdge(crazyId, 'b', 'LINK');
+
+          const result = await g.match(['Node'])
+              .where({ id: crazyId })
+              .out('LINK')
+              .select(n => n.id);
+              
+          expect(result).toEqual(['b']);
+          
+          // Reverse check
+          const reverse = await g.match(['Node'])
+              .where({ id: 'b' })
+              .in('LINK')
+              .select(n => n.id);
+          
+          expect(reverse).toEqual([crazyId]);
+        });
+      });
+    patchStrategy: replace
+snapshot:
+  test/e2e/supply-chain.test.ts: null
+  test/e2e/access-control.test.ts: null
+  test/integration/errors.test.ts: null
+  test/integration/complex-query.test.ts: null
+  test/integration/concurrency.test.ts: null
+approved: true
+linesAdded: 331
+linesRemoved: 0
+linesDifference: 331
+gitCommittedAt: '2025-12-02T12:31:38.681Z'
+status: committed
+id: 36

@@ -29,6 +29,8 @@ The system implements a **write-through caching pattern**:
 
 ## 🐛 Critical Issues
 
+DONE
+
 ### 1. **Race Condition in Write-Through Cache**
 ```typescript
 async addNode(id: string) {
@@ -36,6 +38,9 @@ async addNode(id: string) {
   this.native.addNode(id); // Cache write (no rollback if DB fails)
 }
 ```
+
+DONE
+
 **Fix**: Move cache update *after* successful DB commit. Better yet, invalidate cache and rebuild asynchronously on failure.
 
 ### 2. **Temporal Inconsistency in Traversal**

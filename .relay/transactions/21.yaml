@@ -1,0 +1,129 @@
+uuid: b8a7d9f2-3c1e-4b5a-9f1d-8e2a3c4d5e6f
+projectId: quackgraph
+createdAt: '2025-12-02T10:02:11.635Z'
+gitCommitMsg: 'chore: add .gitignore for Rust, Bun, and DuckDB artifacts'
+promptSummary: Create a .gitignore file for a Rust/Bun monorepo with napi-rs and DuckDB.
+reasoning:
+  - >-
+    Here is the `.gitignore` configuration suitable for a hybrid Rust (Cargo)
+    and TypeScript (Bun) monorepo using `napi-rs` and DuckDB.
+  - 'This configuration ignores:'
+  - 1.  **Rust Build Artifacts:** `target/` directories.
+  - 2.  **Node/Bun Dependencies:** `node_modules`.
+  - >-
+    3.  **Napi-rs Generated Files:** The compiled `.node` binaries and the
+    auto-generated JS/TS bindings in `packages/native/`.
+  - >-
+    4.  **Database Files:** Local DuckDB files and WAL logs created during tests
+    or execution.
+  - 5.  **System/Editor Files:** Standard noise like `.DS_Store` and `.vscode`.
+operations:
+  - type: write
+    path: .gitignore
+    content: |-
+      # --- Rust / Cargo ---
+      target/
+      **/*.rs.bk
+      debug/
+      release/
+
+      # --- Node.js / Bun ---
+      node_modules/
+      npm-debug.log
+      yarn-error.log
+      yarn-debug.log
+      pnpm-debug.log
+      # Keep bun.lockb committed for consistent dependency resolution
+
+      # --- Build Outputs (TypeScript) ---
+      dist/
+      lib/
+      out/
+      build/
+      *.tsbuildinfo
+
+      # --- Napi-rs / Native Bindings ---
+      # The binary module
+      packages/native/*.node
+
+      # Auto-generated bindings by napi-rs
+      packages/native/index.js
+      packages/native/index.d.ts
+      packages/native/browser.js
+      packages/native/browser.d.ts
+
+      # Intermediate artifacts for cross-compilation
+      packages/native/npm/
+      packages/native/artifacts/
+
+      # --- QuackGraph / DuckDB Storage ---
+      # Local database files
+      *.duckdb
+      *.duckdb.wal
+      *.db
+      *.db.wal
+
+      # Topology snapshots
+      *.snapshot
+      *.bin
+
+      # --- Testing & Coverage ---
+      coverage/
+      .nyc_output/
+      quack-test-*.duckdb
+
+      # --- OS & Editor ---
+      .DS_Store
+      Thumbs.db
+      .idea/
+      .vscode/
+      *.swp
+      *.swo
+    patchStrategy: replace
+snapshot:
+  .gitignore: |
+    # relay state
+    #/.relay/
+
+    # Dependencies
+    node_modules/
+
+    # Build Output
+    dist/
+    *.tsbuildinfo
+
+    # TGP Local Sandbox
+    .tgp/
+
+    # Environment Variables
+    .env
+    .env.local
+    .env.*.local
+
+    # Logs
+    npm-debug.log*
+    yarn-debug.log*
+    yarn-error.log*
+    logs/
+    *.log
+
+    # OS Files
+    .DS_Store
+    Thumbs.db
+
+    # IDEs
+    .vscode/
+    .idea/
+
+    # Testing
+    coverage/
+
+    # Temporary
+    tmp/
+approved: true
+linesAdded: 45
+linesRemoved: 26
+linesDifference: 71
+gitCommittedAt: null
+status: committed
+id: 21

@@ -1,0 +1,383 @@
+uuid: 14573c22-bf4c-4d34-b48c-e7b4d28c2cef
+projectId: quackgraph
+createdAt: '2025-12-02T10:21:06.832Z'
+gitCommitMsg: >-
+  fix: serialize array parameters as JSON to avoid DuckDB binding issues
+
+  The DuckDB Node.js driver was incorrectly binding array parameters as
+  scalars.  This change manually serializes arrays to JSON strings and uses
+  `?::JSON::TEXT[]` casting in SQL to ensure correct type handling. Also fixed
+  an unused variable warning in db.ts.
+promptSummary: >-
+  Fix 'VARCHAR to VARCHAR[]' conversion error by manually serializing arrays to
+  JSON strings and casting in SQL. Also fix linter warning.
+reasoning:
+  - >-
+    To fix the array binding issue with DuckDB (where `TEXT[]` parameters are
+    being interpreted incorrectly by the driver as scalar `VARCHAR`), I will
+    switch to serializing the array as a JSON string and casting it explicitly
+    in SQL (`?::JSON::TEXT[]`). This bypasses the driver's ambiguous array
+    parameter handling.
+  - >-
+    I will also fix the linter warning in `db.ts` regarding the unused variable
+    `e`.
+operations:
+  - type: write
+    path: packages/quack-graph/src/schema.ts
+    content: >
+      --- packages/quack-graph/src/schema.ts
+
+      +++ packages/quack-graph/src/schema.ts
+
+      @@ -32,8 +32,8 @@
+             );
+             // 2. Insert new version
+             await tx.execute(`
+               INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
+      -        VALUES (nextval('seq_node_id'), ?, ?, ?::JSON, current_timestamp,
+      NULL)
+
+      -      `, [id, labels, JSON.stringify(properties)]);
+
+      +        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON,
+      current_timestamp, NULL)
+
+      +      `, [id, JSON.stringify(labels), JSON.stringify(properties)]);
+           });
+         }
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/db.ts
+    content: |
+      --- packages/quack-graph/src/db.ts
+      +++ packages/quack-graph/src/db.ts
+      @@ -148,7 +148,7 @@
+                   } else {
+                      runFallback();
+                   }
+      -         } catch(e) {
+      +         } catch(_e) {
+                   runFallback();
+                }
+             }
+    patchStrategy: standard-diff
+snapshot:
+  packages/quack-graph/src/db.ts: >-
+    import { Database } from 'duckdb-async';
+
+    import { tableFromJSON, tableToIPC } from 'apache-arrow';
+
+
+    // Interface for operations that can be performed within a transaction or
+    globally
+
+    export interface DbExecutor {
+      // biome-ignore lint/suspicious/noExplicitAny: SQL params are generic
+      execute(sql: string, params?: any[]): Promise<void>;
+      // biome-ignore lint/suspicious/noExplicitAny: SQL results are generic
+      query(sql: string, params?: any[]): Promise<any[]>;
+    }
+
+
+    export class DuckDBManager implements DbExecutor {
+      private db: Database | null = null;
+      private _path: string;
+
+      constructor(path: string = ':memory:') {
+        this._path = path;
+      }
+
+      async init() {
+        if (!this.db) {
+          this.db = await Database.create(this._path);
+        }
+      }
+
+      get path(): string {
+        return this._path;
+      }
+
+      getDb(): Database {
+        if (!this.db) {
+          throw new Error('Database not initialized. Call init() first.');
+        }
+        return this.db;
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: SQL params
+      async execute(sql: string, params: any[] = []): Promise<void> {
+        const db = this.getDb();
+        await db.run(sql, ...params);
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: SQL results
+      async query(sql: string, params: any[] = []): Promise<any[]> {
+        const db = this.getDb();
+        return await db.all(sql, ...params);
+      }
+
+      /**
+       * Executes a callback within a transaction using a dedicated connection.
+       * This guarantees that all operations inside the callback share the same ACID scope.
+       */
+      async transaction<T>(callback: (executor: DbExecutor) => Promise<T>): Promise<T> {
+        const db = this.getDb();
+        const conn = await db.connect();
+        
+        // Create a transaction-bound executor wrapper
+        const txExecutor: DbExecutor = {
+          // biome-ignore lint/suspicious/noExplicitAny: SQL params
+          execute: async (sql: string, params: any[] = []) => {
+            await conn.run(sql, ...params);
+          },
+          // biome-ignore lint/suspicious/noExplicitAny: SQL results
+          query: async (sql: string, params: any[] = []) => {
+            return await conn.all(sql, ...params);
+          }
+        };
+
+        try {
+          await conn.run('BEGIN TRANSACTION');
+          const result = await callback(txExecutor);
+          await conn.run('COMMIT');
+          return result;
+        } catch (e) {
+          try {
+            await conn.run('ROLLBACK');
+          } catch (rollbackError) {
+            console.error('Failed to rollback transaction:', rollbackError);
+          }
+          throw e;
+        } finally {
+          // Best effort close
+          // biome-ignore lint/suspicious/noExplicitAny: DuckDB connection types are incomplete
+          if (conn && typeof (conn as any).close === 'function') {
+            // biome-ignore lint/suspicious/noExplicitAny: DuckDB connection types are incomplete
+            (conn as any).close();
+          }
+        }
+      }
+
+      /**
+       * Executes a query and returns the raw Apache Arrow IPC Buffer.
+       * Used for high-speed hydration.
+       */
+      // biome-ignore lint/suspicious/noExplicitAny: SQL params
+      async queryArrow(sql: string, params: any[] = []): Promise<Uint8Array> {
+        const db = this.getDb();
+        
+        return new Promise((resolve, reject) => {
+          // Hack: Access underlying node-duckdb connection/database
+          // duckdb-async instance holds 'db' property which is the native Database
+          // biome-ignore lint/suspicious/noExplicitAny: DuckDB internals
+          const rawDb = (db as any).db || db;
+
+          if (!rawDb) return reject(new Error("Could not access underlying DuckDB Native instance."));
+
+          // Helper to merge multiple Arrow batches if necessary
+          const mergeBatches = (batches: Uint8Array[]) => {
+            if (batches.length === 0) return new Uint8Array(0);
+            if (batches.length === 1) return batches[0] ?? new Uint8Array(0);
+            const totalLength = batches.reduce((acc, val) => acc + val.length, 0);
+            const merged = new Uint8Array(totalLength);
+            let offset = 0;
+            for (const batch of batches) {
+              merged.set(batch, offset);
+              offset += batch.length;
+            }
+            return merged;
+          };
+
+          const runFallback = async () => {
+            try {
+              const rows = await this.query(sql, params);
+              if (rows.length === 0) return resolve(new Uint8Array(0));
+              const table = tableFromJSON(rows);
+              const ipc = tableToIPC(table, 'stream');
+              resolve(ipc);
+            } catch (e) {
+              reject(e);
+            }
+          };
+
+          // Try Database.arrowIPCAll (available in newer node-duckdb)
+          if (typeof rawDb.arrowIPCAll === 'function') {
+            // biome-ignore lint/suspicious/noExplicitAny: internal callback signature
+            rawDb.arrowIPCAll(sql, ...params, (err: any, result: any) => {
+              if (err) {
+                const msg = String(err.message || '');
+                if (msg.includes('to_arrow_ipc') || msg.includes('Table Function')) {
+                  return runFallback();
+                }
+                return reject(err);
+              }
+              // Result is usually Array<Uint8Array> (batches)
+              if (Array.isArray(result)) {
+                resolve(mergeBatches(result));
+              } else {
+                resolve(result ?? new Uint8Array(0));
+              }
+            });
+          } else {
+             // Fallback: Create a raw connection
+             try {
+                const rawConn = rawDb.connect();
+                
+                // Handle case where rawDb is actually the connection itself (sometimes happens in certain pool configs)
+                const target = typeof rawDb.arrowIPCAll === 'function' 
+                  ? rawDb 
+                  : (rawConn && typeof rawConn.arrowIPCAll === 'function' ? rawConn : null);
+
+                if (target) {
+                   // biome-ignore lint/suspicious/noExplicitAny: internal callback signature
+                   target.arrowIPCAll(sql, ...params, (err: any, result: any) => {
+                      if (err) {
+                        const msg = String(err.message || '');
+                        if (msg.includes('to_arrow_ipc') || msg.includes('Table Function')) {
+                          return runFallback();
+                        }
+                        return reject(err);
+                      }
+                      if (Array.isArray(result)) {
+                        resolve(mergeBatches(result));
+                      } else {
+                        resolve(result ?? new Uint8Array(0));
+                      }
+                   });
+                } else {
+                   runFallback();
+                }
+             } catch(e) {
+                runFallback();
+             }
+          }
+        });
+      }
+    }
+  packages/quack-graph/src/schema.ts: |-
+    import type { DuckDBManager, DbExecutor } from './db';
+
+    const NODES_TABLE = `
+    CREATE TABLE IF NOT EXISTS nodes (
+        row_id UBIGINT PRIMARY KEY, -- Simple auto-increment equivalent logic handled by sequence
+        id TEXT NOT NULL,
+        labels TEXT[],
+        properties JSON,
+        embedding FLOAT[], -- Vector embedding
+        valid_from TIMESTAMP DEFAULT current_timestamp,
+        valid_to TIMESTAMP DEFAULT NULL
+    );
+    CREATE SEQUENCE IF NOT EXISTS seq_node_id;
+    `;
+
+    const EDGES_TABLE = `
+    CREATE TABLE IF NOT EXISTS edges (
+        source TEXT NOT NULL,
+        target TEXT NOT NULL,
+        type TEXT NOT NULL,
+        properties JSON,
+        valid_from TIMESTAMP DEFAULT current_timestamp,
+        valid_to TIMESTAMP DEFAULT NULL
+    );
+    `;
+
+    export class SchemaManager {
+      constructor(private db: DuckDBManager) {}
+
+      async ensureSchema() {
+        await this.db.execute(NODES_TABLE);
+        await this.db.execute(EDGES_TABLE);
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: generic properties
+      async writeNode(id: string, labels: string[], properties: Record<string, any> = {}) {
+        await this.db.transaction(async (tx: DbExecutor) => {
+          // 1. Close existing record (SCD Type 2)
+          await tx.execute(
+            `UPDATE nodes SET valid_to = current_timestamp WHERE id = ? AND valid_to IS NULL`,
+            [id]
+          );
+          // 2. Insert new version
+          await tx.execute(`
+            INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
+            VALUES (nextval('seq_node_id'), ?, ?, ?::JSON, current_timestamp, NULL)
+          `, [id, labels, JSON.stringify(properties)]);
+        });
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: generic properties
+      async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}) {
+        await this.db.transaction(async (tx: DbExecutor) => {
+          // 1. Close existing edge
+          await tx.execute(
+            `UPDATE edges SET valid_to = current_timestamp WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+            [source, target, type]
+          );
+          // 2. Insert new version
+          await tx.execute(`
+            INSERT INTO edges (source, target, type, properties, valid_from, valid_to) 
+            VALUES (?, ?, ?, ?::JSON, current_timestamp, NULL)
+          `, [source, target, type, JSON.stringify(properties)]);
+        });
+      }
+
+      async deleteNode(id: string) {
+        // Soft Delete: Close the validity period
+        await this.db.transaction(async (tx: DbExecutor) => {
+          await tx.execute(
+            `UPDATE nodes SET valid_to = current_timestamp WHERE id = ? AND valid_to IS NULL`,
+            [id]
+          );
+        });
+      }
+
+      async deleteEdge(source: string, target: string, type: string) {
+        // Soft Delete: Close the validity period
+        await this.db.transaction(async (tx: DbExecutor) => {
+          await tx.execute(
+            `UPDATE edges SET valid_to = current_timestamp WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+            [source, target, type]
+          );
+        });
+      }
+
+      /**
+       * Promotes a JSON property to a native column for faster filtering.
+       * This creates a column on the `nodes` table and backfills it from the `properties` JSON blob.
+       * 
+       * @param label The node label to target (e.g., 'User'). Only nodes with this label will be updated.
+       * @param property The property key to promote (e.g., 'age').
+       * @param type The DuckDB SQL type (e.g., 'INTEGER', 'VARCHAR').
+       */
+      async promoteNodeProperty(label: string, property: string, type: string) {
+        // Sanitize inputs to prevent basic SQL injection (rudimentary check)
+        if (!/^[a-zA-Z0-9_]+$/.test(property)) throw new Error(`Invalid property name: '${property}'. Must be alphanumeric + underscore.`);
+        // Type check is looser to allow various SQL types, but strictly alphanumeric + spaces/parens usually safe enough for now
+        if (!/^[a-zA-Z0-9_() ]+$/.test(type)) throw new Error(`Invalid SQL type: '${type}'.`);
+        // Sanitize label just in case, though it is used as a parameter usually, here we might need dynamic check if we were using it in table names, but we use it in list_contains param.
+        
+        // 1. Add Column (Idempotent)
+        try {
+          // Note: DuckDB 0.9+ supports ADD COLUMN IF NOT EXISTS
+          await this.db.execute(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ${property} ${type}`);
+        } catch (_e) {
+          // Fallback or ignore if column exists
+        }
+
+        // 2. Backfill Data
+        // We use list_contains to only update relevant nodes
+        const sql = `
+          UPDATE nodes 
+          SET ${property} = CAST(json_extract(properties, '$.${property}') AS ${type})
+          WHERE list_contains(labels, ?)
+        `;
+        await this.db.execute(sql, [label]);
+      }
+    }
+approved: true
+linesAdded: 3
+linesRemoved: 3
+linesDifference: 6
+gitCommittedAt: '2025-12-02T10:40:48.526Z'
+status: committed
+id: 26

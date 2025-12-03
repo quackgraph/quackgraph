@@ -1,0 +1,336 @@
+uuid: 76af347b-4806-417e-ab4f-c2eeb7de34c3
+projectId: quackgraph
+createdAt: '2025-12-02T09:19:33.801Z'
+gitCommitMsg: >-
+  test: add comprehensive test suite
+
+  Adds a multi-layer test suite: - test/utils: Helpers for isolated graph
+  creation and cleanup. - test/unit: Validates core graph operations in memory.
+  - test/integration: Verifies persistence and Arrow IPC hydration from disk. -
+  test/e2e: Validates fluent API and social network scenarios.
+promptSummary: >-
+  Created a comprehensive test suite covering Unit (Core), Integration
+  (Persistence/Hydration), and E2E (Social Network) scenarios using Bun's native
+  test runner and real DuckDB instances.
+reasoning:
+  - >-
+    To establish the "Split-Brain" verification suite, I will create the test
+    infrastructure and test files. These tests utilize real DuckDB instances
+    (both in-memory and on-disk) to verify the behavior of the QuackGraph engine
+    without mocking.
+  - '### Step 1: Create Test Utilities'
+  - >-
+    We need a centralized helper to manage the creation of isolated graph
+    instances and handle the cleanup of temporary DuckDB files to ensure
+    idempotency.
+  - '### Step 2: Unit Tests (Core Logic)'
+  - >-
+    These tests verify that the in-memory graph index behaves correctly when
+    operations are performed. We use an in-memory database for speed.
+  - '### Step 3: Integration Tests (Lifecycle & Persistence)'
+  - >-
+    This verifies the "Hydration" loop. We write to a disk-based DuckDB, close
+    the graph, open a new instance on the same file, and verify the Rust index
+    is correctly rebuilt (hydrated) from the Apache Arrow stream.
+  - '### Step 4: E2E Tests (Social Domain)'
+  - >-
+    This verifies the Fluent API `match().where().out().select()` in a realistic
+    scenario, ensuring the query builder correctly orchestrates the "Sandwich"
+    execution model (DuckDB -> Rust -> DuckDB).
+operations:
+  - type: write
+    path: test/utils/helpers.ts
+    content: >-
+      import { unlink } from 'node:fs/promises';
+
+      import { join } from 'node:path';
+
+      import { tmpdir } from 'node:os';
+
+      import { QuackGraph } from '../../packages/quack-graph/src/index';
+
+
+      export const getTempPath = (prefix = 'quack-test') => {
+        const uuid = crypto.randomUUID();
+        return join(tmpdir(), `${prefix}-${uuid}.duckdb`);
+      };
+
+
+      export const createGraph = async (mode: 'memory' | 'disk' = 'memory') => {
+        const path = mode === 'memory' ? ':memory:' : getTempPath();
+        const graph = new QuackGraph(path);
+        await graph.init();
+        return { graph, path };
+      };
+
+
+      export const cleanupGraph = async (path: string) => {
+        if (path === ':memory:') return;
+        try {
+          await unlink(path);
+          // DuckDB creates a WAL file typically (.wal), try to remove it too just in case
+          await unlink(`${path}.wal`).catch(() => {});
+        } catch (e) {
+          // Ignore errors if file doesn't exist
+        }
+      };
+
+
+      /**
+       * Wait for a short duration. Useful if we need to ensure timestamps differ slightly
+       * (though QuackGraph uses microsecond precision usually, node might be ms).
+       */
+      export const sleep = (ms: number) => new Promise((resolve) =>
+      setTimeout(resolve, ms));
+    patchStrategy: replace
+  - type: write
+    path: test/unit/graph.test.ts
+    content: |-
+      import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('Unit: QuackGraph Core', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        beforeEach(async () => {
+          const setup = await createGraph('memory');
+          g = setup.graph;
+          path = setup.path;
+        });
+
+        afterEach(async () => {
+          await cleanupGraph(path);
+        });
+
+        test('should initialize with zero nodes', () => {
+          expect(g.native.nodeCount).toBe(0);
+          expect(g.native.edgeCount).toBe(0);
+        });
+
+        test('should add nodes and increment count', async () => {
+          await g.addNode('u:1', ['User'], { name: 'Alice' });
+          await g.addNode('u:2', ['User'], { name: 'Bob' });
+          
+          // Check Rust Index
+          expect(g.native.nodeCount).toBe(2);
+          
+          // Check DuckDB Storage
+          const rows = await g.db.query('SELECT * FROM nodes');
+          expect(rows.length).toBe(2);
+          expect(rows.find(r => r.id === 'u:1').properties).toContain('Alice');
+        });
+
+        test('should add edges and support traversal', async () => {
+          await g.addNode('a', ['Node']);
+          await g.addNode('b', ['Node']);
+          await g.addEdge('a', 'b', 'LINK');
+
+          expect(g.native.edgeCount).toBe(1);
+
+          // Simple manual traversal check using native directly
+          const neighbors = g.native.traverse(['a'], 'LINK', 'out');
+          expect(neighbors).toEqual(['b']);
+        });
+
+        test('should be idempotent when adding same edge', async () => {
+          await g.addNode('a', ['Node']);
+          await g.addNode('b', ['Node']);
+          
+          await g.addEdge('a', 'b', 'LINK');
+          await g.addEdge('a', 'b', 'LINK'); // Duplicate
+
+          expect(g.native.edgeCount).toBe(1);
+          const neighbors = g.native.traverse(['a'], 'LINK', 'out');
+          expect(neighbors).toEqual(['b']);
+        });
+
+        test('should soft delete nodes and stop traversal', async () => {
+          await g.addNode('a', ['Node']);
+          await g.addNode('b', ['Node']);
+          await g.addEdge('a', 'b', 'LINK');
+
+          let neighbors = g.native.traverse(['a'], 'LINK', 'out');
+          expect(neighbors).toEqual(['b']);
+
+          await g.deleteNode('b');
+
+          // Rust index should treat it as tombstoned
+          neighbors = g.native.traverse(['a'], 'LINK', 'out');
+          expect(neighbors).toEqual([]);
+
+          // Check DB soft delete
+          const rows = await g.db.query("SELECT * FROM nodes WHERE id = 'b' AND valid_to IS NOT NULL");
+          expect(rows.length).toBe(1);
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/integration/lifecycle.test.ts
+    content: |-
+      import { describe, test, expect } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('Integration: Persistence & Hydration', () => {
+        test('should hydrate Rust topology from Disk on startup', async () => {
+          // 1. Setup Graph A (Disk)
+          const { graph: g1, path } = await createGraph('disk');
+
+          // 2. Add Data to Graph A
+          await g1.addNode('root', ['Root']);
+          await g1.addNode('child1', ['Leaf']);
+          await g1.addNode('child2', ['Leaf']);
+          await g1.addEdge('root', 'child1', 'PARENT_OF');
+          await g1.addEdge('root', 'child2', 'PARENT_OF');
+
+          expect(g1.native.nodeCount).toBe(3);
+          expect(g1.native.edgeCount).toBe(2);
+
+          // 3. Initialize Graph B on the same file (Simulates Restart)
+          // Note: In same process, DuckDB handles concurrent access to same file fine
+          const g2 = new QuackGraph(path);
+          await g2.init(); // This triggers hydrate()
+
+          // 4. Verify Graph B State
+          expect(g2.native.nodeCount).toBe(3);
+          expect(g2.native.edgeCount).toBe(2);
+
+          const children = g2.native.traverse(['root'], 'PARENT_OF', 'out');
+          expect(children.length).toBe(2);
+          expect(children).toContain('child1');
+          expect(children).toContain('child2');
+
+          await cleanupGraph(path);
+        });
+
+        test('should respect soft deletes during hydration', async () => {
+          // 1. Setup & Add Data
+          const { graph: g1, path } = await createGraph('disk');
+          await g1.addNode('a', ['A']);
+          await g1.addNode('b', ['B']);
+          await g1.addEdge('a', 'b', 'KNOWS');
+
+          // 2. Soft Delete
+          await g1.deleteEdge('a', 'b', 'KNOWS');
+          
+          // Verify immediate effect
+          expect(g1.native.traverse(['a'], 'KNOWS', 'out')).toEqual([]);
+
+          // 3. Restart / Hydrate
+          const g2 = new QuackGraph(path);
+          await g2.init();
+
+          // 4. Verify Deleted Edge is NOT hydrated
+          // The query `SELECT ... WHERE valid_to IS NULL` should exclude it
+          expect(g2.native.edgeCount).toBe(0);
+          const neighbors = g2.native.traverse(['a'], 'KNOWS', 'out');
+          expect(neighbors).toEqual([]);
+
+          await cleanupGraph(path);
+        });
+      });
+    patchStrategy: replace
+  - type: write
+    path: test/e2e/social.test.ts
+    content: |-
+      import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+      import { createGraph, cleanupGraph } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('E2E: Social Network', () => {
+        let g: QuackGraph;
+        let path: string;
+
+        beforeEach(async () => {
+          // We use disk to ensure full stack is exercised, though memory works too
+          const setup = await createGraph('disk');
+          g = setup.graph;
+          path = setup.path;
+
+          // Seed Data
+          // Alice -> Bob -> Charlie
+          // Alice (30), Bob (25), Charlie (20)
+          await g.addNode('alice', ['User'], { name: 'Alice', age: 30, city: 'NY' });
+          await g.addNode('bob', ['User'], { name: 'Bob', age: 25, city: 'SF' });
+          await g.addNode('charlie', ['User'], { name: 'Charlie', age: 20, city: 'NY' });
+          await g.addNode('dave', ['User'], { name: 'Dave', age: 40, city: 'NY' });
+
+          await g.addEdge('alice', 'bob', 'KNOWS', { since: 2020 });
+          await g.addEdge('bob', 'charlie', 'KNOWS', { since: 2022 });
+          await g.addEdge('alice', 'dave', 'KNOWS', { since: 2010 });
+        });
+
+        afterEach(async () => {
+          await cleanupGraph(path);
+        });
+
+        test('Query: Filter -> Traversal -> Select', async () => {
+          // Find Users named Alice, see who they know
+          const results = await g.match(['User'])
+            .where({ name: 'Alice' })
+            .out('KNOWS')
+            .node(['User'])
+            .select(u => u.name);
+          
+          // Alice knows Bob and Dave
+          expect(results.length).toBe(2);
+          expect(results.sort()).toEqual(['Bob', 'Dave']);
+        });
+
+        test('Query: Filter -> Traversal -> Filter (Sandwich)', async () => {
+          // Find Users named Alice, find who they know that is UNDER 30
+          // This requires DuckDB post-filter
+          // Alice knows Bob (25) and Dave (40). Should only return Bob.
+          
+          // Note: The current fluent API in 'query.ts' supports basic where()
+          // For V1 simple object matching, we can match { age: 25 } but not { age: < 30 } easily without helper
+          // Let's test exact match for now as per current implementation, 
+          // or rely on the query builder logic to pass raw values.
+          
+          const results = await g.match(['User'])
+            .where({ name: 'Alice' })
+            .out('KNOWS')
+            .node(['User'])
+            .where({ age: 25 }) // Filter for Bob
+            .select(u => u.name);
+
+          expect(results).toEqual(['Bob']);
+        });
+
+        test('Optimization: Property Promotion', async () => {
+          // Promote 'age' to a native column (INTEGER)
+          // This is an async schema change
+          await g.optimize.promoteProperty('User', 'age', 'INTEGER');
+
+          // Run the same query again to ensure it still works (transparent to user)
+          // The query builder generates `json_extract(properties, '$.age')` which works even if column exists,
+          // or DuckDB handles the ambiguity. 
+          // Ideally, the query builder should be smart enough to use the column, but for now we test stability.
+          
+          const results = await g.match(['User'])
+            .where({ name: 'Charlie' })
+            .select(u => u.age);
+
+          expect(results[0]).toBe(20);
+          
+          // Verify column exists in schema
+          const tableInfo = await g.db.query("PRAGMA table_info('nodes')");
+          const hasAge = tableInfo.some(c => c.name === 'age' && c.type === 'INTEGER');
+          expect(hasAge).toBe(true);
+        });
+      });
+    patchStrategy: replace
+snapshot:
+  test/utils/helpers.ts: null
+  test/unit/graph.test.ts: null
+  test/integration/lifecycle.test.ts: null
+  test/e2e/social.test.ts: null
+approved: true
+linesAdded: 260
+linesRemoved: 0
+linesDifference: 260
+gitCommittedAt: '2025-12-02T09:19:38.128Z'
+status: committed
+id: 15

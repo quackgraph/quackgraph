@@ -208,6 +208,8 @@ export class QueryBuilder {
     // For V1, we accept that traversal is instant/current, but properties are historical.
 
     for (const step of this.traversals) {
+      const asOfTs = this.graph.context.asOf ? this.graph.context.asOf.getTime() : undefined;
+
       if (currentIds.length === 0) break;
       
       if (step.type === 'recursive') {
@@ -216,11 +218,12 @@ export class QueryBuilder {
           step.edge,
           step.direction || 'out',
           step.bounds?.min,
-          step.bounds?.max
+          step.bounds?.max,
+          asOfTs
         );
       } else {
         // step.type is 'out' | 'in'
-        currentIds = this.graph.native.traverse(currentIds, step.edge, step.type as 'out' | 'in');
+        currentIds = this.graph.native.traverse(currentIds, step.edge, step.type as 'out' | 'in', asOfTs);
       }
     }
 

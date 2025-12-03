@@ -1,0 +1,133 @@
+uuid: 4f12a3b9-1234-4567-8901-abcdef123499
+projectId: quackgraph
+createdAt: '2025-12-02T08:11:00.507Z'
+gitCommitMsg: >-
+  chore: add unified typecheck and lint scripts
+
+  - Adds `typecheck` script: Runs `tsc --noEmit` and `cargo check --workspace`.
+  - Adds `lint` script: Runs `cargo clippy`. - Configures root `tsconfig.json`
+  to include package sources.
+promptSummary: >-
+  Added `typecheck`, `lint`, `test`, and `build` scripts to the root
+  `package.json` that invoke both TypeScript (`tsc`) and Rust (`cargo`)
+  toolchains. Updated `tsconfig.json` to include files in `packages/*/src`.
+reasoning:
+  - >-
+    To integrate Rust checking into your development workflow, I will update
+    `package.json` to run both TypeScript and Cargo commands for `typecheck` and
+    `lint`. I'll also configure the root `tsconfig.json` to recognize the code
+    in the `packages/` workspace.
+  - '### 1. Update `package.json`'
+  - >-
+    I'll add the scripts and ensure `typescript` is available as a dev
+    dependency.
+  - '-   **`typecheck`**: Runs `tsc` (TypeScript) and `cargo check` (Rust).'
+  - >-
+    -   **`lint`**: Runs `cargo clippy` (Rust Linter). (You can add ESLint/Biome
+    later for JS).
+  - '-   **`build`**: Builds the native bindings and then transmpiles TS.'
+  - '### 2. Update `tsconfig.json`'
+  - >-
+    I'll update the configuration to include the source files in the `packages`
+    directory, ensuring `tsc` actually checks your code.
+  - '### 3. Verification (Self-Correction for Native Package)'
+  - >-
+    The `native` package is primarily Rust, but `napi-rs` generates a `.d.ts`
+    file. For `tsc` to succeed in `packages/quack-graph` (which imports
+    `@quackgraph/native`), the native package usually needs to be built at least
+    once to generate that type definition.
+  - 'The `scripts` I added allow you to run:'
+  - 1.  `bun run build` (Generates binary + `.d.ts`)
+  - 2.  `bun run typecheck` (Checks TS against generated `.d.ts` + Checks Rust)
+  - 3.  `bun run lint` (Lints Rust)
+operations:
+  - type: write
+    path: package.json
+    content: |
+      --- package.json
+      +++ package.json
+      @@ -6,5 +6,12 @@
+         "workspaces": [
+           "packages/*"
+         ],
+      +  "scripts": {
+      +    "typecheck": "tsc --noEmit && cargo check --workspace",
+      +    "lint": "cargo clippy --workspace -- -D warnings",
+      +    "test": "bun test && cargo test --workspace",
+      +    "build": "bun run --cwd packages/native build && tsc"
+      +  },
+         "devDependencies": {
+      -    "@types/bun": "latest"
+      +    "@types/bun": "latest",
+      +    "typescript": "^5.0.0"
+         },
+         "peerDependencies": {
+    patchStrategy: standard-diff
+  - type: write
+    path: tsconfig.json
+    content: |
+      --- tsconfig.json
+      +++ tsconfig.json
+      @@ -24,5 +24,6 @@
+           "noUnusedLocals": false,
+           "noUnusedParameters": false,
+           "noPropertyAccessFromIndexSignature": false
+      -  }
+      +  },
+      +  "include": ["packages/*/src/**/*"]
+       }
+    patchStrategy: standard-diff
+snapshot:
+  package.json: |
+    {
+      "name": "quackgraph",
+      "module": "index.ts",
+      "type": "module",
+      "private": true,
+      "workspaces": [
+        "packages/*"
+      ],
+      "devDependencies": {
+        "@types/bun": "latest"
+      },
+      "peerDependencies": {
+        "typescript": "^5"
+      }
+    }
+  tsconfig.json: |
+    {
+      "compilerOptions": {
+        // Environment setup & latest features
+        "lib": ["ESNext"],
+        "target": "ESNext",
+        "module": "Preserve",
+        "moduleDetection": "force",
+        "jsx": "react-jsx",
+        "allowJs": true,
+
+        // Bundler mode
+        "moduleResolution": "bundler",
+        "allowImportingTsExtensions": true,
+        "verbatimModuleSyntax": true,
+        "noEmit": true,
+
+        // Best practices
+        "strict": true,
+        "skipLibCheck": true,
+        "noFallthroughCasesInSwitch": true,
+        "noUncheckedIndexedAccess": true,
+        "noImplicitOverride": true,
+
+        // Some stricter flags (disabled by default)
+        "noUnusedLocals": false,
+        "noUnusedParameters": false,
+        "noPropertyAccessFromIndexSignature": false
+      }
+    }
+approved: true
+linesAdded: 10
+linesRemoved: 2
+linesDifference: 12
+gitCommittedAt: '2025-12-02T08:17:06.623Z'
+status: committed
+id: 5

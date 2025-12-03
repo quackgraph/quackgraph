@@ -1,0 +1,866 @@
+uuid: 45749f70-d7d8-4f24-9543-559d3e8e19f9
+projectId: quackgraph
+createdAt: '2025-12-02T08:43:11.534Z'
+gitCommitMsg: >-
+  feat: enable bidirectional traversals and property promotion
+
+  - Refactored `GraphIndex` to support Incoming and Outgoing traversals via
+  `Direction` enum. - Updated NAPI bridge to accept direction parameter. -
+  Updated TS `QueryBuilder` to pass traversal direction to native layer. - Added
+  `g.optimize.promoteProperty` to materialize JSON fields as native DuckDB
+  columns.
+promptSummary: >-
+  Implement bidirectional traversal (IN/OUT) in Rust Core and TypeScript Query
+  Builder,  and add 'promoteProperty' optimization feature to Schema Manager.
+reasoning:
+  - >-
+    Refactoring the Rust Core to support bidirectional traversal and
+    implementing the Property Promotion feature in the TypeScript layer.
+  - '### 1. Refactor Rust Core Topology (`crates/quack_core/src/topology.rs`)'
+  - >-
+    We introduce a `Direction` enum and generalize the `traverse` method to
+    handle both Incoming and Outgoing edges.
+  - '### 2. Export Direction from Core (`crates/quack_core/src/lib.rs`)'
+  - '### 3. Update Native Bridge (`packages/native/src/lib.rs`)'
+  - >-
+    Expose the `direction` parameter to Node.js. Defaults to `Outgoing` if
+    unspecified.
+  - >-
+    ### 4. Implement Property Promotion in Schema
+    (`packages/quack-graph/src/schema.ts`)
+  - >-
+    This implements the `ALTER TABLE` and `UPDATE` logic to promote JSON fields
+    to native DuckDB columns.
+  - >-
+    ### 5. Expose Optimization API in Graph
+    (`packages/quack-graph/src/graph.ts`)
+  - Adds the `optimize` getter and connects it to the schema manager.
+  - >-
+    ### 6. Update Query Builder to use Direction
+    (`packages/quack-graph/src/query.ts`)
+  - Pass the `step.type` ('out' or 'in') to the native traversal method.
+  - '### Final Step: Summary'
+  - >-
+    We have successfully enabled bidirectional traversals in the Rust core and
+    NAPI bridge, updated the Query Builder to utilize them, and added the
+    Property Promotion feature to the Schema Manager.
+operations:
+  - type: write
+    path: crates/quack_core/src/topology.rs
+    content: >
+      --- crates/quack_core/src/topology.rs
+
+      +++ crates/quack_core/src/topology.rs
+
+      @@ -24,6 +24,11 @@
+           tombstones: BitVec,
+       }
+       
+      +pub enum Direction {
+
+      +    Outgoing,
+
+      +    Incoming,
+
+      +}
+
+      +
+       impl GraphIndex {
+           pub fn new() -> Self {
+               Self {
+      @@ -107,13 +112,18 @@
+               }
+           }
+       
+      -    /// Generic traversal step.
+
+      -    /// Given a list of source node IDs (strings), find all neighbors
+      connected by `edge_type`.
+
+      -    /// Returns unique neighbor IDs (strings).
+
+      -    pub fn traverse_out(&self, sources: &[String], edge_type:
+      Option<&str>) -> Vec<String> {
+
+      +    /// Generic traversal step (Bidirectional).
+
+      +    /// Given a list of source node IDs (strings), find all neighbors
+      connected by `edge_type`
+
+      +    /// in the specified `direction`.
+
+      +    pub fn traverse(&self, sources: &[String], edge_type: Option<&str>,
+      direction: Direction) -> Vec<String> {
+               let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
+               
+               let mut result_ids: Vec<u32> = Vec::with_capacity(sources.len() * 2);
+      +        
+
+      +        let adjacency = match direction {
+
+      +            Direction::Outgoing => &self.outgoing,
+
+      +            Direction::Incoming => &self.incoming,
+
+      +        };
+       
+               for src_str in sources {
+                   // If source node doesn't exist in our index, skip it
+      @@ -123,7 +133,7 @@
+                           continue;
+                       }
+       
+      -                if let Some(edges) = self.outgoing.get(src_id as usize) {
+
+      +                if let Some(edges) = adjacency.get(src_id as usize) {
+                           for &(target, type_id) in edges {
+                               // Apply edge type filter if present
+                               if let Some(req_type) = type_filter {
+    patchStrategy: standard-diff
+  - type: write
+    path: crates/quack_core/src/lib.rs
+    content: |
+      --- crates/quack_core/src/lib.rs
+      +++ crates/quack_core/src/lib.rs
+      @@ -3,3 +3,3 @@
+       pub use interner::Interner;
+      -pub use topology::GraphIndex;
+      +pub use topology::{GraphIndex, Direction};
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/native/src/lib.rs
+    content: >
+      --- packages/native/src/lib.rs
+
+      +++ packages/native/src/lib.rs
+
+      @@ -3,5 +3,5 @@
+       use napi::bindgen_prelude::*;
+       use napi_derive::napi;
+      -use quack_core::GraphIndex;
+
+      +use quack_core::{GraphIndex, Direction};
+       use arrow::ipc::reader::StreamReader;
+       use std::io::Cursor;
+      @@ -46,9 +46,13 @@
+           }
+       
+      -    /// Performs a single-hop traversal.
+
+      +    /// Performs a single-hop traversal (bfs-step).
+           /// Returns unique neighbor IDs.
+           #[napi]
+      -    pub fn traverse(&self, sources: Vec<String>, edge_type:
+      Option<String>) -> Vec<String> {
+
+      -        self.inner.traverse_out(&sources, edge_type.as_deref())
+
+      +    pub fn traverse(&self, sources: Vec<String>, edge_type:
+      Option<String>, direction: Option<String>) -> Vec<String> {
+
+      +        let dir = match direction.as_deref() {
+
+      +            Some("in") | Some("IN") => Direction::Incoming,
+
+      +            _ => Direction::Outgoing,
+
+      +        };
+
+      +        self.inner.traverse(&sources, edge_type.as_deref(), dir)
+           }
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/schema.ts
+    content: >
+      --- packages/quack-graph/src/schema.ts
+
+      +++ packages/quack-graph/src/schema.ts
+
+      @@ -51,4 +51,32 @@
+           await this.db.execute(sql, [source, target, type, JSON.stringify(properties)]);
+         }
+      +
+
+      +  /**
+
+      +   * Promotes a JSON property to a native column for faster filtering.
+
+      +   * This creates a column on the `nodes` table and backfills it from the
+      `properties` JSON blob.
+
+      +   * 
+
+      +   * @param label The node label to target (e.g., 'User'). Only nodes
+      with this label will be updated.
+
+      +   * @param property The property key to promote (e.g., 'age').
+
+      +   * @param type The DuckDB SQL type (e.g., 'INTEGER', 'VARCHAR').
+
+      +   */
+
+      +  async promoteNodeProperty(label: string, property: string, type:
+      string) {
+
+      +    // Sanitize inputs to prevent basic SQL injection (rudimentary check)
+
+      +    if (!/^[a-zA-Z0-9_]+$/.test(property)) throw new Error("Invalid
+      property name");
+
+      +    // Type check is looser to allow various SQL types, but strictly
+      alphanumeric + spaces/parens usually safe enough for now
+
+      +    
+
+      +    // 1. Add Column (Idempotent)
+
+      +    try {
+
+      +      // Note: DuckDB 0.9+ supports ADD COLUMN IF NOT EXISTS
+
+      +      await this.db.execute(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS
+      ${property} ${type}`);
+
+      +    } catch (e) {
+
+      +      // Fallback or ignore if column exists
+
+      +    }
+
+      +
+
+      +    // 2. Backfill Data
+
+      +    // We use list_contains to only update relevant nodes
+
+      +    const sql = `
+
+      +      UPDATE nodes 
+
+      +      SET ${property} = CAST(json_extract(properties, '$.${property}') AS
+      ${type})
+
+      +      WHERE list_contains(labels, ?)
+
+      +    `;
+
+      +    await this.db.execute(sql, [label]);
+
+      +  }
+       }
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/graph.ts
+    content: >
+      --- packages/quack-graph/src/graph.ts
+
+      +++ packages/quack-graph/src/graph.ts
+
+      @@ -87,4 +87,14 @@
+         }
+       
+      +  // --- Optimization & Maintenance ---
+
+      +
+
+      +  get optimize() {
+
+      +    return {
+
+      +      promoteProperty: async (label: string, property: string, type:
+      string) => {
+
+      +        await this.schema.promoteNodeProperty(label, property, type);
+
+      +      },
+
+      +    };
+
+      +  }
+
+      +
+         // --- Read Operations ---
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/query.ts
+    content: >
+      --- packages/quack-graph/src/query.ts
+
+      +++ packages/quack-graph/src/query.ts
+
+      @@ -128,7 +128,7 @@
+           for (const step of this.traversals) {
+             if (currentIds.length === 0) break;
+      -      if (step.type === 'out') {
+
+      -        currentIds = this.graph.native.traverse(currentIds, step.edge);
+
+      -      }
+
+      +      // step.type is 'out' | 'in'
+
+      +      // native.traverse(ids, edgeType, direction)
+
+      +      currentIds = this.graph.native.traverse(currentIds, step.edge,
+      step.type);
+           }
+       
+           // --- Step 3: DuckDB Hydration (Top Bun) ---
+    patchStrategy: standard-diff
+snapshot:
+  crates/quack_core/src/topology.rs: |-
+    use crate::interner::Interner;
+    use bitvec::prelude::*;
+    use std::collections::HashMap;
+    use arrow::record_batch::RecordBatch;
+    use arrow::array::AsArray;
+
+    /// The core Graph Index.
+    /// Stores topology in RAM using integer IDs.
+    #[derive(Default, Debug)]
+    pub struct GraphIndex {
+        node_interner: Interner,
+        
+        // Mapping edge type strings (e.g. "KNOWS") to u8 for compact storage.
+        // Limit: 256 edge types per graph in V1.
+        edge_type_map: HashMap<String, u8>,
+        edge_type_vec: Vec<String>,
+
+        // Forward Graph: Source Node ID -> List of (Target Node ID, Edge Type ID)
+        outgoing: Vec<Vec<(u32, u8)>>,
+        
+        // Reverse Graph: Target Node ID -> List of (Source Node ID, Edge Type ID)
+        incoming: Vec<Vec<(u32, u8)>>,
+
+        // Bitmask for soft-deleted nodes.
+        // true = deleted (tombstone), false = active.
+        tombstones: BitVec,
+    }
+
+    impl GraphIndex {
+        pub fn new() -> Self {
+            Self {
+                node_interner: Interner::new(),
+                edge_type_map: HashMap::new(),
+                edge_type_vec: Vec::new(),
+                outgoing: Vec::new(),
+                incoming: Vec::new(),
+                tombstones: BitVec::new(),
+            }
+        }
+
+        /// Resolves or creates an internal u32 ID for a node string.
+        /// Resizes internal storage if necessary.
+        pub fn get_or_create_node(&mut self, id: &str) -> u32 {
+            let internal_id = self.node_interner.intern(id);
+            let idx = internal_id as usize;
+
+            // Ensure vectors are large enough to hold this node
+            if idx >= self.outgoing.len() {
+                let new_len = idx + 1;
+                self.outgoing.resize_with(new_len, Vec::new);
+                self.incoming.resize_with(new_len, Vec::new);
+                // Resize tombstones, filling new slots with false (active)
+                self.tombstones.resize(new_len, false);
+            }
+            internal_id
+        }
+
+        /// Resolves or creates a u8 ID for an edge type string.
+        /// Panics if more than 255 edge types are used (V1 constraint).
+        pub fn get_or_create_type(&mut self, type_name: &str) -> u8 {
+            if let Some(&id) = self.edge_type_map.get(type_name) {
+                return id;
+            }
+            let id = self.edge_type_vec.len();
+            if id > 255 {
+                panic!("QuackGraph V1 Limit: Max 256 unique edge types supported.");
+            }
+            let id_u8 = id as u8;
+            self.edge_type_vec.push(type_name.to_string());
+            self.edge_type_map.insert(type_name.to_string(), id_u8);
+            id_u8
+        }
+
+        /// Adds an edge to the graph. 
+        /// This is an O(1) append operation (amortized).
+        pub fn add_edge(&mut self, source: &str, target: &str, edge_type: &str) {
+            let u_src = self.get_or_create_node(source);
+            let u_tgt = self.get_or_create_node(target);
+            let u_type = self.get_or_create_type(edge_type);
+
+            // Add to forward index
+            self.outgoing[u_src as usize].push((u_tgt, u_type));
+            
+            // Add to reverse index
+            self.incoming[u_tgt as usize].push((u_src, u_type));
+        }
+
+        /// Ingests an Apache Arrow RecordBatch directly.
+        /// Expected Schema: [source: Utf8, target: Utf8, type: Utf8]
+        pub fn add_arrow_batch(&mut self, batch: &RecordBatch) {
+            // We expect 3 columns. Safe to panic in V1 if schema mismatches as it's controlled by our own TS layer.
+            if batch.num_columns() < 3 {
+                return;
+            }
+
+            let sources = batch.column(0).as_string::<i32>();
+            let targets = batch.column(1).as_string::<i32>();
+            let types = batch.column(2).as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                let src = sources.value(i);
+                let tgt = targets.value(i);
+                let edge_type = types.value(i);
+                
+                // This still does hash lookups, but avoids the JS<->Rust string alloc overhead
+                self.add_edge(src, tgt, edge_type);
+            }
+        }
+
+        /// Generic traversal step.
+        /// Given a list of source node IDs (strings), find all neighbors connected by `edge_type`.
+        /// Returns unique neighbor IDs (strings).
+        pub fn traverse_out(&self, sources: &[String], edge_type: Option<&str>) -> Vec<String> {
+            let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
+            
+            let mut result_ids: Vec<u32> = Vec::with_capacity(sources.len() * 2);
+
+            for src_str in sources {
+                // If source node doesn't exist in our index, skip it
+                if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                    // Check if node is deleted
+                    if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                        continue;
+                    }
+
+                    if let Some(edges) = self.outgoing.get(src_id as usize) {
+                        for &(target, type_id) in edges {
+                            // Apply edge type filter if present
+                            if let Some(req_type) = type_filter {
+                                if req_type != type_id {
+                                    continue;
+                                }
+                            }
+                            // Check if target is deleted
+                            if self.tombstones.get(target as usize).as_deref() == Some(&true) {
+                                continue;
+                            }
+                            result_ids.push(target);
+                        }
+                    }
+                }
+            }
+
+            // Deduplicate results
+            result_ids.sort_unstable();
+            result_ids.dedup();
+
+            // Convert back to strings
+            result_ids
+                .into_iter()
+                .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
+                .collect()
+        }
+
+        pub fn node_count(&self) -> usize {
+            self.node_interner.len()
+        }
+    }
+  packages/quack-graph/src/schema.ts: |-
+    import { DuckDBManager } from './db';
+
+    const NODES_TABLE = `
+    CREATE TABLE IF NOT EXISTS nodes (
+        row_id UBIGINT PRIMARY KEY, -- Simple auto-increment equivalent logic handled by sequence
+        id TEXT NOT NULL,
+        labels TEXT[],
+        properties JSON,
+        embedding FLOAT[], -- Vector embedding
+        valid_from TIMESTAMP DEFAULT current_timestamp,
+        valid_to TIMESTAMP DEFAULT NULL
+    );
+    CREATE SEQUENCE IF NOT EXISTS seq_node_id;
+    `;
+
+    const EDGES_TABLE = `
+    CREATE TABLE IF NOT EXISTS edges (
+        source TEXT NOT NULL,
+        target TEXT NOT NULL,
+        type TEXT NOT NULL,
+        properties JSON,
+        valid_from TIMESTAMP DEFAULT current_timestamp,
+        valid_to TIMESTAMP DEFAULT NULL
+    );
+    `;
+
+    export class SchemaManager {
+      constructor(private db: DuckDBManager) {}
+
+      async ensureSchema() {
+        await this.db.execute(NODES_TABLE);
+        await this.db.execute(EDGES_TABLE);
+      }
+
+      async writeNode(id: string, labels: string[], properties: Record<string, any> = {}) {
+        // Append-only: We insert a new version. 
+        // In a full implementation, we might soft-delete the previous version by setting valid_to.
+        // For V1 Alpha, we just insert.
+        const sql = `
+          INSERT INTO nodes (row_id, id, labels, properties) 
+          VALUES (nextval('seq_node_id'), ?, ?, ?::JSON)
+        `;
+        await this.db.execute(sql, [id, labels, JSON.stringify(properties)]);
+      }
+
+      async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}) {
+        const sql = `
+          INSERT INTO edges (source, target, type, properties) 
+          VALUES (?, ?, ?, ?::JSON)
+        `;
+        await this.db.execute(sql, [source, target, type, JSON.stringify(properties)]);
+      }
+    }
+  crates/quack_core/src/lib.rs: |-
+    pub mod interner;
+    pub mod topology;
+
+    pub use interner::Interner;
+    pub use topology::GraphIndex;
+  packages/native/src/lib.rs: |-
+    #![deny(clippy::all)]
+
+    use napi::bindgen_prelude::*;
+    use napi_derive::napi;
+    use quack_core::GraphIndex;
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    #[napi]
+    pub struct NativeGraph {
+        inner: GraphIndex,
+    }
+
+    #[napi]
+    impl NativeGraph {
+        #[napi(constructor)]
+        pub fn new() -> Self {
+            Self {
+                inner: GraphIndex::new(),
+            }
+        }
+
+        #[napi]
+        pub fn add_node(&mut self, id: String) {
+            self.inner.get_or_create_node(&id);
+        }
+
+        /// Hydrates the graph from an Arrow IPC stream (Buffer).
+        /// Zero-copy (mostly) data transfer from DuckDB.
+        #[napi]
+        pub fn load_arrow_ipc(&mut self, buffer: Buffer) -> napi::Result<()> {
+            let cursor = Cursor::new(buffer.as_ref());
+            let reader = StreamReader::try_new(cursor, None).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+            for batch in reader {
+                let batch = batch.map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                self.inner.add_arrow_batch(&batch);
+            }
+            Ok(())
+        }
+
+        #[napi]
+        pub fn add_edge(&mut self, source: String, target: String, edge_type: String) {
+            self.inner.add_edge(&source, &target, &edge_type);
+        }
+
+        /// Performs a single-hop traversal.
+        /// Returns unique neighbor IDs.
+        #[napi]
+        pub fn traverse(&self, sources: Vec<String>, edge_type: Option<String>) -> Vec<String> {
+            self.inner.traverse_out(&sources, edge_type.as_deref())
+        }
+
+        /// Returns the number of nodes in the interned index.
+        /// Useful for debugging hydration.
+        #[napi(getter)]
+        pub fn node_count(&self) -> u32 {
+            // We cast to u32 because exposing usize to JS can be finicky depending on napi version,
+            // though napi usually handles numbers well. Safe for V1.
+            self.inner.node_count() as u32
+        }
+    }
+  packages/quack-graph/src/query.ts: |-
+    import { QuackGraph } from './graph';
+
+    type TraversalStep = {
+      type: 'out' | 'in';
+      edge: string;
+    };
+
+    export class QueryBuilder {
+      private graph: QuackGraph;
+      private startLabels: string[];
+
+      // Bottom Bun Filters (Initial selection)
+      private initialFilters: Record<string, any> = {};
+      private vectorSearch: { vector: number[]; limit: number } | null = null;
+
+      // The Meat (Traversal)
+      private traversals: TraversalStep[] = [];
+
+      // Top Bun Filters (Final selection)
+      private terminalFilters: Record<string, any> = {};
+
+      constructor(graph: QuackGraph, labels: string[]) {
+        this.graph = graph;
+        this.startLabels = labels;
+      }
+
+      /**
+       * Filter nodes by properties.
+       * If called before traversal, applies to Start Nodes.
+       * If called after traversal, applies to End Nodes.
+       */
+      where(criteria: Record<string, any>): this {
+        if (this.traversals.length === 0) {
+          this.initialFilters = { ...this.initialFilters, ...criteria };
+        } else {
+          this.terminalFilters = { ...this.terminalFilters, ...criteria };
+        }
+        return this;
+      }
+
+      /**
+       * Perform a Vector Similarity Search (HNSW).
+       * This effectively sorts the start nodes by distance to the query vector.
+       */
+      nearText(vector: number[], options: { limit?: number } = {}): this {
+        this.vectorSearch = { 
+          vector, 
+          limit: options.limit || 10 
+        };
+        return this;
+      }
+
+      out(edgeType: string): this {
+        this.traversals.push({ type: 'out', edge: edgeType });
+        return this;
+      }
+
+      /**
+       * Helper to construct the temporal validity clause
+       */
+      private getTemporalClause(tableAlias: string = ''): string {
+        const prefix = tableAlias ? `${tableAlias}.` : '';
+        if (this.graph.context.asOf) {
+          // Time Travel: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+          // We pass the timestamp as a parameter later, or interpolate strict ISO string
+          const iso = this.graph.context.asOf.toISOString();
+          return `${prefix}valid_from <= '${iso}' AND (${prefix}valid_to > '${iso}' OR ${prefix}valid_to IS NULL)`;
+        }
+        // Default: Current valid records (valid_to is NULL)
+        return `${prefix}valid_to IS NULL`;
+      }
+
+      async select<T = any>(mapper?: (node: any) => T): Promise<T[]> {
+        // --- Step 1: DuckDB Filter (Bottom Bun) ---
+        // Objective: Get a list of "Active" Node IDs to feed into the graph.
+
+        let query = `SELECT id FROM nodes`;
+        const params: any[] = [];
+        const conditions: string[] = [];
+
+        // 1.a Temporal Filter
+        conditions.push(this.getTemporalClause());
+
+        // 1.b Label Filter
+        if (this.startLabels.length > 0) {
+          // Check if ANY of the labels match. For V1 we check the first one or intersection.
+          conditions.push(`list_contains(labels, ?)`);
+          params.push(this.startLabels[0]);
+        }
+
+        // 1.c Property Filter
+        for (const [key, value] of Object.entries(this.initialFilters)) {
+          conditions.push(`json_extract(properties, '$.${key}') = ?`);
+          params.push(value);
+        }
+
+        // 1.d Vector Search (Order By Distance)
+        let orderBy = '';
+        let limit = '';
+        if (this.vectorSearch) {
+          // Requires: array_distance(embedding, [1,2,3])
+          // DuckDB VSS extension syntax
+          const vectorStr = `[${this.vectorSearch.vector.join(',')}]`; // Inline vector for V1
+          orderBy = `ORDER BY array_distance(embedding, ${vectorStr}::FLOAT[${this.vectorSearch.vector.length}])`;
+          limit = `LIMIT ${this.vectorSearch.limit}`;
+        }
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` ${orderBy} ${limit}`;
+
+        const startRows = await this.graph.db.query(query, params);
+        let currentIds: string[] = startRows.map(row => row.id);
+
+        if (currentIds.length === 0) return [];
+
+        // --- Step 2: Rust Traversal (The Meat) ---
+        // Note: Rust Graph Index is currently "Latest Topology Only". 
+        // Time Travel on topology requires checking edge validity during traversal (V2).
+        // For V1, we accept that traversal is instant/current, but properties are historical.
+
+        for (const step of this.traversals) {
+          if (currentIds.length === 0) break;
+          if (step.type === 'out') {
+            currentIds = this.graph.native.traverse(currentIds, step.edge);
+          }
+        }
+
+        // --- Step 3: DuckDB Hydration (Top Bun) ---
+        // Objective: Fetch full properties for the resulting IDs, applying terminal filters.
+
+        if (currentIds.length === 0) return [];
+
+        const finalConditions: string[] = [];
+        const finalParams: any[] = [];
+
+        // 3.a IDs match
+        // We can't use parameters for IN clause effectively with dynamic length in all drivers.
+        // Constructing placeholders.
+        const placeholders = currentIds.map(() => '?').join(',');
+        finalConditions.push(`id IN (${placeholders})`);
+        finalParams.push(...currentIds);
+
+        // 3.b Temporal Validity
+        finalConditions.push(this.getTemporalClause());
+
+        // 3.c Terminal Property Filters
+        for (const [key, value] of Object.entries(this.terminalFilters)) {
+          finalConditions.push(`json_extract(properties, '$.${key}') = ?`);
+          finalParams.push(value);
+        }
+
+        const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join(' AND ')}`;
+        const results = await this.graph.db.query(finalSql, finalParams);
+
+        return results.map(r => {
+          let props = r.properties;
+          if (typeof props === 'string') {
+            try { props = JSON.parse(props); } catch {}
+          }
+          const node = {
+            id: r.id,
+            labels: r.labels,
+            ...props
+          };
+          return mapper ? mapper(node) : node;
+        });
+      }
+    }
+  packages/quack-graph/src/graph.ts: |-
+    import { NativeGraph } from '@quackgraph/native';
+    import { DuckDBManager } from './db';
+    import { SchemaManager } from './schema';
+    import { QueryBuilder } from './query';
+
+    export class QuackGraph {
+      db: DuckDBManager;
+      schema: SchemaManager;
+      native: NativeGraph;
+      
+      // Context for the current instance (Time Travel)
+      context: {
+        asOf?: Date;
+      } = {};
+
+      constructor(path: string = ':memory:', options: { asOf?: Date } = {}) {
+        this.db = new DuckDBManager(path);
+        this.schema = new SchemaManager(this.db);
+        this.native = new NativeGraph();
+        this.context.asOf = options.asOf;
+      }
+
+      async init() {
+        await this.db.init();
+        
+        // Load Extensions
+        await this.db.execute("INSTALL vss; LOAD vss;");
+        
+        await this.schema.ensureSchema();
+        
+        // If we are in time-travel mode, we might skip hydration or hydrate a snapshot (Advanced).
+        // For V1, we always hydrate "Current Active" topology.
+        await this.hydrate();
+      }
+
+      /**
+       * Hydrates the in-memory Rust graph from the persistent DuckDB storage.
+       * This is critical for the "Split-Brain" architecture.
+       */
+      async hydrate() {
+        // V2 Implementation: Arrow IPC Zero-Copy
+        // We fetch the edges as a raw buffer.
+        // Note: 'valid_to IS NULL' ensures we only load currently active edges.
+        try {
+          const ipcBuffer = await this.db.queryArrow(
+            "SELECT source, target, type FROM edges WHERE valid_to IS NULL"
+          );
+        
+          // Pass buffer to Native (Rust)
+          // Note: We need to cast the Uint8Array to the Buffer type expected by Napi if strictly typed,
+          // but usually Buffer.from(uint8array) or direct passing works in Node.
+          if (ipcBuffer && ipcBuffer.length > 0) {
+             // In Node environment, we might need Buffer.from
+             // In Bun, Uint8Array is often sufficient or compatible.
+             // We assume native.loadArrowIpc handles the buffer.
+             this.native.loadArrowIpc(ipcBuffer as any);
+          }
+        } catch (e) {
+          console.warn("Fast Arrow Hydration failed, falling back or empty graph.", e);
+        }
+      }
+
+      asOf(date: Date): QuackGraph {
+        // Return a shallow copy with new context
+        const g = new QuackGraph(this.db['path'], { asOf: date });
+        // Share the same DB connection and Native index (assuming topology is shared/latest)
+        g.db = this.db;
+        g.schema = this.schema;
+        g.native = this.native;
+        return g;
+      }
+
+      // --- Write Operations (Write-Through) ---
+
+      async addNode(id: string, labels: string[], props: Record<string, any> = {}) {
+        // 1. Write to Disk (Source of Truth)
+        await this.schema.writeNode(id, labels, props);
+        // 2. Write to RAM (Cache)
+        this.native.addNode(id);
+      }
+
+      async addEdge(source: string, target: string, type: string, props: Record<string, any> = {}) {
+        // 1. Write to Disk
+        await this.schema.writeEdge(source, target, type, props);
+        // 2. Write to RAM
+        this.native.addEdge(source, target, type);
+      }
+
+      // --- Read Operations ---
+
+      match(labels: string[]): QueryBuilder {
+        return new QueryBuilder(this, labels);
+      }
+    }
+approved: true
+linesAdded: 68
+linesRemoved: 13
+linesDifference: 81
+gitCommittedAt: '2025-12-02T08:47:55.352Z'
+status: committed
+id: 9

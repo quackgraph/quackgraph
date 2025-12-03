@@ -1,0 +1,127 @@
+uuid: 5a2b3c4d-9999-8888-7777-666655554444
+projectId: quackgraph
+createdAt: '2025-12-02T08:12:14.561Z'
+gitCommitMsg: >-
+  chore: add biome for linting and formatting
+
+  - Adds `@biomejs/biome` dev dependency. - Adds `biome.json` configuration. -
+  Updates `lint` script to run both `biome lint` and `cargo clippy`. - Adds
+  `format` script to run `biome format` and `cargo fmt`.
+promptSummary: >-
+  Added Biome for linting and formatting. Created `biome.json` and updated
+  `package.json` scripts (`lint`, `format`) to execute both Biome (for JS/TS)
+  and Cargo (for Rust) commands.
+reasoning:
+  - >-
+    I will add **Biome** to the project to handle JavaScript/TypeScript
+    formatting and linting. I'll integrate it into your existing scripts so that
+    a single command checks both languages.
+  - '### 1. Create Biome Configuration'
+  - >-
+    I'll create a `biome.json` file to configure the formatter and linter. It is
+    set to respect your `.gitignore` and ignore the Rust build artifacts
+    (`target/`).
+  - '### 2. Update `package.json`'
+  - >-
+    I will add `@biomejs/biome` to `devDependencies` and update the scripts to
+    run Biome alongside Cargo.
+  - '*   **`lint`**: Now runs `biome lint` (JS/TS) AND `cargo clippy` (Rust).'
+  - '*   **`format`**: New script. Runs `biome format --write` AND `cargo fmt`.'
+  - >-
+    *   **`check`**: A comprehensive check running Biome checks, TypeScript
+    types, and Rust checks.
+operations:
+  - type: write
+    path: biome.json
+    content: |-
+      {
+        "$schema": "https://biomejs.dev/schemas/1.8.3/schema.json",
+        "vcs": {
+          "enabled": true,
+          "clientKind": "git",
+          "useIgnoreFile": true
+        },
+        "files": {
+          "ignoreUnknown": true,
+          "ignore": ["target", "dist", "node_modules", "**/*.node"]
+        },
+        "formatter": {
+          "enabled": true,
+          "indentStyle": "space",
+          "indentWidth": 2,
+          "lineWidth": 100
+        },
+        "organizeImports": {
+          "enabled": true
+        },
+        "linter": {
+          "enabled": true,
+          "rules": {
+            "recommended": true
+          }
+        },
+        "javascript": {
+          "formatter": {
+            "quoteStyle": "single",
+            "trailingCommas": "es5"
+          }
+        }
+      }
+    patchStrategy: replace
+  - type: write
+    path: package.json
+    content: |
+      --- package.json
+      +++ package.json
+      @@ -7,9 +7,11 @@
+           "packages/*"
+         ],
+         "scripts": {
+      +    "format": "biome format --write . && cargo fmt",
+           "typecheck": "tsc --noEmit && cargo check --workspace",
+      -    "lint": "cargo clippy --workspace -- -D warnings",
+      +    "lint": "biome lint . && cargo clippy --workspace -- -D warnings",
+      +    "check": "biome check . && bun run typecheck",
+           "test": "bun test && cargo test --workspace",
+           "build": "bun run --cwd packages/native build && tsc"
+         },
+         "devDependencies": {
+      -    "@types/bun": "latest",
+      -    "typescript": "^5.0.0"
+      +    "@biomejs/biome": "latest",
+      +    "@types/bun": "latest",
+      +    "typescript": "^5.0.0"
+         },
+    patchStrategy: standard-diff
+snapshot:
+  biome.json: null
+  package.json: |
+    {
+      "name": "quackgraph",
+      "module": "index.ts",
+      "type": "module",
+      "private": true,
+      "workspaces": [
+        "packages/*"
+      ],
+      "scripts": {
+        "typecheck": "tsc --noEmit && cargo check --workspace",
+        "lint": "cargo clippy --workspace -- -D warnings",
+        "test": "bun test && cargo test --workspace",
+        "build": "bun run --cwd packages/native build && tsc"
+      },
+      "devDependencies": {
+        "@types/bun": "latest",
+        "typescript": "^5.0.0"
+      },
+      "peerDependencies": {
+        "typescript": "^5"
+      }
+    }
+approved: true
+linesAdded: 37
+linesRemoved: 1
+linesDifference: 38
+gitCommittedAt: '2025-12-02T08:17:06.623Z'
+status: committed
+id: 6

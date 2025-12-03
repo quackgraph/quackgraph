@@ -1,0 +1,1040 @@
+uuid: 23e6f9b1-8b2a-4a8e-9d2a-1c5b8e9d2a1c
+projectId: quackgraph
+createdAt: '2025-12-02T08:53:32.147Z'
+gitCommitMsg: >-
+  feat(core): ACID temporal writes and Arrow hydration
+
+  - Added transaction support to DuckDBManager - Implemented SCD Type 2 writes
+  for Nodes and Edges - Enabled Zero-Copy Arrow IPC hydration - Robustified Rust
+  topology Arrow ingestion
+promptSummary: >-
+  Implemented ACID temporal writes using transactions (SCD Type 2) and wired up
+  Zero-Copy Arrow hydration for the graph topology.
+reasoning:
+  - >-
+    The user wants to implement ACID Temporal Writes and Zero-Copy Arrow
+    Hydration for QuackGraph.
+  - I will follow the plan to modify the files.
+  - >-
+    Step 1: Update `packages/quack-graph/src/db.ts` to support transactions and
+    robust Arrow IPC.
+  - >-
+    Step 2: Update `packages/quack-graph/src/schema.ts` to implement SCD Type 2
+    writes using transactions.
+  - >-
+    Step 3: Update `crates/quack_core/src/topology.rs` to better handle Arrow
+    types.
+  - 'Step 4: Update `packages/quack-graph/src/graph.ts` to wire up the hydration.'
+  - 'Step 5: Update `packages/quack-graph/src/query.ts` to fix temporal clauses.'
+operations:
+  - type: write
+    path: packages/quack-graph/src/db.ts
+    content: >-
+      import { Database } from 'duckdb-async';
+
+
+      // Interface for operations that can be performed within a transaction or
+      globally
+
+      export interface DbExecutor {
+        execute(sql: string, params?: any[]): Promise<void>;
+        query(sql: string, params?: any[]): Promise<any[]>;
+      }
+
+
+      export class DuckDBManager implements DbExecutor {
+        private db: Database | null = null;
+        private path: string;
+
+        constructor(path: string = ':memory:') {
+          this.path = path;
+        }
+
+        async init() {
+          if (!this.db) {
+            this.db = await Database.create(this.path);
+          }
+        }
+
+        getDb(): Database {
+          if (!this.db) {
+            throw new Error('Database not initialized. Call init() first.');
+          }
+          return this.db;
+        }
+
+        async execute(sql: string, params: any[] = []): Promise<void> {
+          const db = this.getDb();
+          await db.run(sql, params);
+        }
+
+        async query(sql: string, params: any[] = []): Promise<any[]> {
+          const db = this.getDb();
+          return await db.all(sql, params);
+        }
+
+        /**
+         * Executes a callback within a transaction using a dedicated connection.
+         * This guarantees that all operations inside the callback share the same ACID scope.
+         */
+        async transaction<T>(callback: (executor: DbExecutor) => Promise<T>): Promise<T> {
+          const db = this.getDb();
+          const conn = await db.connect();
+          
+          // Create a transaction-bound executor wrapper
+          const txExecutor: DbExecutor = {
+            execute: async (sql: string, params: any[] = []) => {
+              await conn.run(sql, params);
+            },
+            query: async (sql: string, params: any[] = []) => {
+              return await conn.all(sql, params);
+            }
+          };
+
+          try {
+            await conn.run('BEGIN TRANSACTION');
+            const result = await callback(txExecutor);
+            await conn.run('COMMIT');
+            return result;
+          } catch (e) {
+            try {
+              await conn.run('ROLLBACK');
+            } catch (rollbackError) {
+              console.error('Failed to rollback transaction:', rollbackError);
+            }
+            throw e;
+          } finally {
+            // Best effort close
+            if (conn && typeof (conn as any).close === 'function') {
+              (conn as any).close();
+            }
+          }
+        }
+
+        /**
+         * Executes a query and returns the raw Apache Arrow IPC Buffer.
+         * Used for high-speed hydration.
+         */
+        async queryArrow(sql: string, params: any[] = []): Promise<Uint8Array> {
+          const db = this.getDb();
+          
+          return new Promise((resolve, reject) => {
+            // Hack: Access underlying node-duckdb connection/database
+            // duckdb-async instance holds 'db' property which is the native Database
+            const rawDb = (db as any).db || db;
+
+            // Helper to merge multiple Arrow batches if necessary
+            const mergeBatches = (batches: Uint8Array[]) => {
+              if (batches.length === 0) return new Uint8Array(0);
+              if (batches.length === 1) return batches[0];
+              const totalLength = batches.reduce((acc, val) => acc + val.length, 0);
+              const merged = new Uint8Array(totalLength);
+              let offset = 0;
+              for (const batch of batches) {
+                merged.set(batch, offset);
+                offset += batch.length;
+              }
+              return merged;
+            };
+
+            // Try Database.arrowIPCAll (available in newer node-duckdb)
+            if (typeof rawDb.arrowIPCAll === 'function') {
+              rawDb.arrowIPCAll(sql, params, (err: any, result: any) => {
+                if (err) return reject(err);
+                // Result is usually Array<Uint8Array> (batches)
+                if (Array.isArray(result)) {
+                  resolve(mergeBatches(result));
+                } else {
+                  resolve(result);
+                }
+              });
+            } else {
+               // Fallback: Create a raw connection
+               try {
+                  const rawConn = rawDb.connect();
+                  if (rawConn && typeof rawConn.arrowIPCAll === 'function') {
+                     rawConn.arrowIPCAll(sql, params, (err: any, result: any) => {
+                        if (err) return reject(err);
+                        if (Array.isArray(result)) {
+                          resolve(mergeBatches(result));
+                        } else {
+                          resolve(result);
+                        }
+                     });
+                  } else {
+                     reject(new Error("Underlying DuckDB driver does not support arrowIPCAll"));
+                  }
+               } catch(e) {
+                  reject(e);
+               }
+            }
+          });
+        }
+      }
+    patchStrategy: replace
+  - type: write
+    path: packages/quack-graph/src/schema.ts
+    content: >
+      --- packages/quack-graph/src/schema.ts
+
+      +++ packages/quack-graph/src/schema.ts
+
+      @@ -1,4 +1,4 @@
+
+      -import { DuckDBManager } from './db';
+
+      +import { DuckDBManager, DbExecutor } from './db';
+       
+       const NODES_TABLE = `
+      @@ -34,18 +34,23 @@
+       
+         async writeNode(id: string, labels: string[], properties: Record<string, any> = {}) {
+      -    // Append-only: We insert a new version. 
+
+      -    // In a full implementation, we might soft-delete the previous
+      version by setting valid_to.
+
+      -    // For V1 Alpha, we just insert.
+
+      -    const sql = `
+
+      -      INSERT INTO nodes (row_id, id, labels, properties) 
+
+      -      VALUES (nextval('seq_node_id'), ?, ?, ?::JSON)
+
+      -    `;
+
+      -    await this.db.execute(sql, [id, labels, JSON.stringify(properties)]);
+
+      +    await this.db.transaction(async (tx: DbExecutor) => {
+
+      +      // 1. Close existing record (SCD Type 2)
+
+      +      await tx.execute(
+
+      +        `UPDATE nodes SET valid_to = current_timestamp WHERE id = ? AND
+      valid_to IS NULL`,
+
+      +        [id]
+
+      +      );
+
+      +      // 2. Insert new version
+
+      +      await tx.execute(`
+
+      +        INSERT INTO nodes (row_id, id, labels, properties, valid_from,
+      valid_to) 
+
+      +        VALUES (nextval('seq_node_id'), ?, ?, ?::JSON, current_timestamp,
+      NULL)
+
+      +      `, [id, labels, JSON.stringify(properties)]);
+
+      +    });
+         }
+       
+         async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}) {
+      -    const sql = `
+
+      -      INSERT INTO edges (source, target, type, properties) 
+
+      -      VALUES (?, ?, ?, ?::JSON)
+
+      -    `;
+
+      -    await this.db.execute(sql, [source, target, type,
+      JSON.stringify(properties)]);
+
+      +    await this.db.transaction(async (tx: DbExecutor) => {
+
+      +      // 1. Close existing edge
+
+      +      await tx.execute(
+
+      +        `UPDATE edges SET valid_to = current_timestamp WHERE source = ?
+      AND target = ? AND type = ? AND valid_to IS NULL`,
+
+      +        [source, target, type]
+
+      +      );
+
+      +      // 2. Insert new version
+
+      +      await tx.execute(`
+
+      +        INSERT INTO edges (source, target, type, properties, valid_from,
+      valid_to) 
+
+      +        VALUES (?, ?, ?, ?::JSON, current_timestamp, NULL)
+
+      +      `, [source, target, type, JSON.stringify(properties)]);
+
+      +    });
+         }
+       
+    patchStrategy: standard-diff
+  - type: write
+    path: crates/quack_core/src/topology.rs
+    content: >
+      --- crates/quack_core/src/topology.rs
+
+      +++ crates/quack_core/src/topology.rs
+
+      @@ -107,11 +107,17 @@
+               }
+       
+      -        // Helper to get string accessors regardless of Utf8 vs LargeUtf8
+
+      +        // Helper to get string accessors regardless of Utf8 (i32
+      offsets) vs LargeUtf8 (i64 offsets)
+               let get_accessor = |col: &ArrayRef| -> Result<Box<dyn Fn(usize) -> &str + '_>, String> {
+                   match col.data_type() {
+      -                DataType::Utf8 => Ok(Box::new(move |i|
+      col.as_string::<i32>().value(i))),
+
+      -                DataType::LargeUtf8 => Ok(Box::new(move |i|
+      col.as_string::<i64>().value(i))),
+
+      -                dt => Err(format!("Unsupported column type: {:?}.
+      Expected Utf8 or LargeUtf8.", dt))
+
+      +                DataType::Utf8 => {
+
+      +                    let arr = col.as_string::<i32>();
+
+      +                    Ok(Box::new(move |i| arr.value(i)))
+
+      +                },
+
+      +                DataType::LargeUtf8 => {
+
+      +                    let arr = col.as_string::<i64>();
+
+      +                    Ok(Box::new(move |i| arr.value(i)))
+
+      +                },
+
+      +                dt => Err(format!("Unsupported Arrow column type: {:?}.
+      Expected Utf8 or LargeUtf8.", dt))
+                   }
+               };
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/graph.ts
+    content: >
+      --- packages/quack-graph/src/graph.ts
+
+      +++ packages/quack-graph/src/graph.ts
+
+      @@ -42,16 +42,16 @@
+          * This is critical for the "Split-Brain" architecture.
+          */
+         async hydrate() {
+      -    // V2 Implementation: Arrow IPC Zero-Copy
+
+      -    // We fetch the edges as a raw buffer.
+
+      -    // Note: 'valid_to IS NULL' ensures we only load currently active
+      edges.
+
+      +    // Zero-Copy Arrow IPC
+
+      +    // 'valid_to IS NULL' ensures we only load currently active edges.
+           try {
+             const ipcBuffer = await this.db.queryArrow(
+               "SELECT source, target, type FROM edges WHERE valid_to IS NULL"
+             );
+           
+             if (ipcBuffer && ipcBuffer.length > 0) {
+      -         // In Node environment, we might need Buffer.from
+
+      -         // In Bun, Uint8Array is often sufficient or compatible.
+
+      -         // We assume native.loadArrowIpc handles the buffer.
+
+      -         this.native.loadArrowIpc(ipcBuffer as any);
+
+      +         // Napi-rs expects a Buffer or equivalent
+
+      +         // Buffer.from is zero-copy in Node for Uint8Array usually, or
+      cheap copy
+
+      +         // We cast to any to satisfy the generated TS definitions which
+      might expect Buffer
+
+      +         this.native.loadArrowIpc(ipcBuffer as any);
+             }
+           } catch (e: any) {
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/query.ts
+    content: >
+      --- packages/quack-graph/src/query.ts
+
+      +++ packages/quack-graph/src/query.ts
+
+      @@ -74,7 +74,8 @@
+           if (this.graph.context.asOf) {
+             // Time Travel: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+      -      // We pass the timestamp as a parameter later, or interpolate
+      strict ISO string
+
+      +      // Interpolate strict ISO string
+             const iso = this.graph.context.asOf.toISOString();
+      -      return `${prefix}valid_from <= '${iso}' AND (${prefix}valid_to >
+      '${iso}' OR ${prefix}valid_to IS NULL)`;
+
+      +      // DuckDB TIMESTAMP comparison works with ISO strings
+
+      +      return `(${prefix}valid_from <= '${iso}' AND (${prefix}valid_to >
+      '${iso}' OR ${prefix}valid_to IS NULL))`;
+           }
+           // Default: Current valid records (valid_to is NULL)
+    patchStrategy: standard-diff
+snapshot:
+  packages/quack-graph/src/db.ts: |-
+    import { Database } from 'duckdb-async';
+
+    export class DuckDBManager {
+      private db: Database | null = null;
+      private path: string;
+
+      constructor(path: string = ':memory:') {
+        this.path = path;
+      }
+
+      async init() {
+        if (!this.db) {
+          this.db = await Database.create(this.path);
+        }
+      }
+
+      getDb(): Database {
+        if (!this.db) {
+          throw new Error('Database not initialized. Call init() first.');
+        }
+        return this.db;
+      }
+
+      async execute(sql: string, params: any[] = []): Promise<void> {
+        const db = this.getDb();
+        await db.run(sql, params);
+      }
+
+      async query(sql: string, params: any[] = []): Promise<any[]> {
+        const db = this.getDb();
+        return await db.all(sql, params);
+      }
+
+      /**
+       * Executes a query and returns the raw Apache Arrow IPC Buffer.
+       * Used for high-speed hydration.
+       */
+      async queryArrow(sql: string, params: any[] = []): Promise<Uint8Array> {
+        const db = this.getDb();
+        // Hack: Access underlying node-duckdb connection if using duckdb-async wrapper
+        // duckdb-async usually exposes the raw db via some property or simply forwards calls.
+        // For this implementation, we assume we can get a connection that supports arrowIPCAll.
+        // In many bindings, this is `conn.arrowIPCAll`.
+        
+        return new Promise((resolve, reject) => {
+          // @ts-ignore - Accessing internal driver method
+          db.all(sql, params, { arrow: true }, (err: any, rows: any) => {
+             // Note: The specific API depends on the driver version. 
+             // Standard `duckdb` node driver uses `connection.arrowIPCAll`.
+             // duckdb-async `all` usually returns rows. 
+             // We will simulate the behavior here assuming the driver is configured or patched.
+             // Real implementation would access `(db as any).db.arrowIPCAll(...)`.
+             
+             // Fallback for V1 POC if specific driver method missing:
+             // We rely on the user to have a driver that returns arrow buffer if we ask nicely,
+             // or we implement a bridge.
+             const rawDb = (db as any).db || db;
+             if (typeof rawDb.arrowIPCAll === 'function') {
+                 rawDb.arrowIPCAll(sql, params, (arrowErr: any, result: any) => {
+                     if (arrowErr) return reject(arrowErr);
+                     // result is an array of Uint8Arrays (batches) or a single one.
+                     // We merge them or return the first for simplicity of this snippet.
+                     else resolve(result[0] as Uint8Array); // V1 assumption
+                 });
+             } else {
+                 reject(new Error("Underlying DuckDB driver does not support arrowIPCAll"));
+             }
+          });
+        });
+      }
+    }
+  packages/quack-graph/src/schema.ts: |-
+    import { DuckDBManager } from './db';
+
+    const NODES_TABLE = `
+    CREATE TABLE IF NOT EXISTS nodes (
+        row_id UBIGINT PRIMARY KEY, -- Simple auto-increment equivalent logic handled by sequence
+        id TEXT NOT NULL,
+        labels TEXT[],
+        properties JSON,
+        embedding FLOAT[], -- Vector embedding
+        valid_from TIMESTAMP DEFAULT current_timestamp,
+        valid_to TIMESTAMP DEFAULT NULL
+    );
+    CREATE SEQUENCE IF NOT EXISTS seq_node_id;
+    `;
+
+    const EDGES_TABLE = `
+    CREATE TABLE IF NOT EXISTS edges (
+        source TEXT NOT NULL,
+        target TEXT NOT NULL,
+        type TEXT NOT NULL,
+        properties JSON,
+        valid_from TIMESTAMP DEFAULT current_timestamp,
+        valid_to TIMESTAMP DEFAULT NULL
+    );
+    `;
+
+    export class SchemaManager {
+      constructor(private db: DuckDBManager) {}
+
+      async ensureSchema() {
+        await this.db.execute(NODES_TABLE);
+        await this.db.execute(EDGES_TABLE);
+      }
+
+      async writeNode(id: string, labels: string[], properties: Record<string, any> = {}) {
+        // Append-only: We insert a new version. 
+        // In a full implementation, we might soft-delete the previous version by setting valid_to.
+        // For V1 Alpha, we just insert.
+        const sql = `
+          INSERT INTO nodes (row_id, id, labels, properties) 
+          VALUES (nextval('seq_node_id'), ?, ?, ?::JSON)
+        `;
+        await this.db.execute(sql, [id, labels, JSON.stringify(properties)]);
+      }
+
+      async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}) {
+        const sql = `
+          INSERT INTO edges (source, target, type, properties) 
+          VALUES (?, ?, ?, ?::JSON)
+        `;
+        await this.db.execute(sql, [source, target, type, JSON.stringify(properties)]);
+      }
+
+      /**
+       * Promotes a JSON property to a native column for faster filtering.
+       * This creates a column on the `nodes` table and backfills it from the `properties` JSON blob.
+       * 
+       * @param label The node label to target (e.g., 'User'). Only nodes with this label will be updated.
+       * @param property The property key to promote (e.g., 'age').
+       * @param type The DuckDB SQL type (e.g., 'INTEGER', 'VARCHAR').
+       */
+      async promoteNodeProperty(label: string, property: string, type: string) {
+        // Sanitize inputs to prevent basic SQL injection (rudimentary check)
+        if (!/^[a-zA-Z0-9_]+$/.test(property)) throw new Error(`Invalid property name: ${property}`);
+        // Type check is looser to allow various SQL types, but strictly alphanumeric + spaces/parens usually safe enough for now
+        
+        // 1. Add Column (Idempotent)
+        try {
+          // Note: DuckDB 0.9+ supports ADD COLUMN IF NOT EXISTS
+          await this.db.execute(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ${property} ${type}`);
+        } catch (e) {
+          // Fallback or ignore if column exists
+        }
+
+        // 2. Backfill Data
+        // We use list_contains to only update relevant nodes
+        const sql = `
+          UPDATE nodes 
+          SET ${property} = CAST(json_extract(properties, '$.${property}') AS ${type})
+          WHERE list_contains(labels, ?)
+        `;
+        await this.db.execute(sql, [label]);
+      }
+    }
+  crates/quack_core/src/topology.rs: |-
+    use crate::interner::Interner;
+    use bitvec::prelude::*;
+    use std::collections::HashMap;
+    use arrow::record_batch::RecordBatch;
+    use arrow::array::{AsArray, Array, ArrayRef};
+    use arrow::datatypes::DataType;
+
+    /// The core Graph Index.
+    /// Stores topology in RAM using integer IDs.
+    #[derive(Default, Debug)]
+    pub struct GraphIndex {
+        node_interner: Interner,
+        
+        // Mapping edge type strings (e.g. "KNOWS") to u8 for compact storage.
+        // Limit: 256 edge types per graph in V1.
+        edge_type_map: HashMap<String, u8>,
+        edge_type_vec: Vec<String>,
+
+        // Forward Graph: Source Node ID -> List of (Target Node ID, Edge Type ID)
+        outgoing: Vec<Vec<(u32, u8)>>,
+        
+        // Reverse Graph: Target Node ID -> List of (Source Node ID, Edge Type ID)
+        incoming: Vec<Vec<(u32, u8)>>,
+
+        // Bitmask for soft-deleted nodes.
+        // true = deleted (tombstone), false = active.
+        tombstones: BitVec,
+    }
+
+    pub enum Direction {
+        Outgoing,
+        Incoming,
+    }
+
+    impl GraphIndex {
+        pub fn new() -> Self {
+            Self {
+                node_interner: Interner::new(),
+                edge_type_map: HashMap::new(),
+                edge_type_vec: Vec::new(),
+                outgoing: Vec::new(),
+                incoming: Vec::new(),
+                tombstones: BitVec::new(),
+            }
+        }
+
+        /// Resolves or creates an internal u32 ID for a node string.
+        /// Resizes internal storage if necessary.
+        pub fn get_or_create_node(&mut self, id: &str) -> u32 {
+            let internal_id = self.node_interner.intern(id);
+            let idx = internal_id as usize;
+
+            // Ensure vectors are large enough to hold this node
+            if idx >= self.outgoing.len() {
+                let new_len = idx + 1;
+                self.outgoing.resize_with(new_len, Vec::new);
+                self.incoming.resize_with(new_len, Vec::new);
+                // Resize tombstones, filling new slots with false (active)
+                self.tombstones.resize(new_len, false);
+            }
+            internal_id
+        }
+
+        /// Returns the total number of edges in the graph.
+        pub fn edge_count(&self) -> usize {
+            self.outgoing.iter().map(|edges| edges.len()).sum()
+        }
+
+        /// Resolves or creates a u8 ID for an edge type string.
+        /// Panics if more than 255 edge types are used (V1 constraint).
+        pub fn get_or_create_type(&mut self, type_name: &str) -> u8 {
+            if let Some(&id) = self.edge_type_map.get(type_name) {
+                return id;
+            }
+            let id = self.edge_type_vec.len();
+            if id > 255 {
+                panic!("QuackGraph V1 Limit: Max 256 unique edge types supported.");
+            }
+            let id_u8 = id as u8;
+            self.edge_type_vec.push(type_name.to_string());
+            self.edge_type_map.insert(type_name.to_string(), id_u8);
+            id_u8
+        }
+
+        /// Adds an edge to the graph. 
+        /// This is an O(1) append operation (amortized).
+        pub fn add_edge(&mut self, source: &str, target: &str, edge_type: &str) {
+            let u_src = self.get_or_create_node(source);
+            let u_tgt = self.get_or_create_node(target);
+            let u_type = self.get_or_create_type(edge_type);
+
+            // Add to forward index
+            self.outgoing[u_src as usize].push((u_tgt, u_type));
+            
+            // Add to reverse index
+            self.incoming[u_tgt as usize].push((u_src, u_type));
+        }
+
+        /// Ingests an Apache Arrow RecordBatch directly.
+        /// Expected Schema: [source: Utf8, target: Utf8, type: Utf8]
+        pub fn add_arrow_batch(&mut self, batch: &RecordBatch) -> Result<(), String> {
+            // We expect 3 columns. Safe to panic in V1 if schema mismatches as it's controlled by our own TS layer.
+            if batch.num_columns() < 3 {
+                return Err(format!("Batch has {} columns, expected at least 3 (source, target, type)", batch.num_columns()));
+            }
+
+            let num_rows = batch.num_rows();
+            if num_rows == 0 {
+                return Ok(());
+            }
+
+            // Helper to get string accessors regardless of Utf8 vs LargeUtf8
+            let get_accessor = |col: &ArrayRef| -> Result<Box<dyn Fn(usize) -> &str + '_>, String> {
+                match col.data_type() {
+                    DataType::Utf8 => Ok(Box::new(move |i| col.as_string::<i32>().value(i))),
+                    DataType::LargeUtf8 => Ok(Box::new(move |i| col.as_string::<i64>().value(i))),
+                    dt => Err(format!("Unsupported column type: {:?}. Expected Utf8 or LargeUtf8.", dt))
+                }
+            };
+
+            let src_fn = get_accessor(batch.column(0))?;
+            let tgt_fn = get_accessor(batch.column(1))?;
+            let type_fn = get_accessor(batch.column(2))?;
+
+            for i in 0..num_rows {
+                self.add_edge(src_fn(i), tgt_fn(i), type_fn(i));
+            }
+            Ok(())
+        }
+
+        /// Generic traversal step (Bidirectional).
+        /// Given a list of source node IDs (strings), find all neighbors connected by `edge_type`
+        /// in the specified `direction`.
+        pub fn traverse(&self, sources: &[String], edge_type: Option<&str>, direction: Direction) -> Vec<String> {
+            let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
+            
+            let mut result_ids: Vec<u32> = Vec::with_capacity(sources.len() * 2);
+            
+            let adjacency = match direction {
+                Direction::Outgoing => &self.outgoing,
+                Direction::Incoming => &self.incoming,
+            };
+
+            for src_str in sources {
+                // If source node doesn't exist in our index, skip it
+                if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                    // Check if node is deleted
+                    if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                        continue;
+                    }
+
+                    if let Some(edges) = adjacency.get(src_id as usize) {
+                        for &(target, type_id) in edges {
+                            // Apply edge type filter if present
+                            if let Some(req_type) = type_filter {
+                                if req_type != type_id {
+                                    continue;
+                                }
+                            }
+                            // Check if target is deleted
+                            if self.tombstones.get(target as usize).as_deref() == Some(&true) {
+                                continue;
+                            }
+                            result_ids.push(target);
+                        }
+                    }
+                }
+            }
+
+            // Deduplicate results
+            result_ids.sort_unstable();
+            result_ids.dedup();
+
+            // Convert back to strings
+            result_ids
+                .into_iter()
+                .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
+                .collect()
+        }
+
+        pub fn node_count(&self) -> usize {
+            self.node_interner.len()
+        }
+    }
+  packages/quack-graph/src/graph.ts: |-
+    import { NativeGraph } from '@quackgraph/native';
+    import { DuckDBManager } from './db';
+    import { SchemaManager } from './schema';
+    import { QueryBuilder } from './query';
+
+    export class QuackGraph {
+      db: DuckDBManager;
+      schema: SchemaManager;
+      native: NativeGraph;
+      
+      // Context for the current instance (Time Travel)
+      context: {
+        asOf?: Date;
+      } = {};
+
+      constructor(path: string = ':memory:', options: { asOf?: Date } = {}) {
+        this.db = new DuckDBManager(path);
+        this.schema = new SchemaManager(this.db);
+        this.native = new NativeGraph();
+        this.context.asOf = options.asOf;
+      }
+
+      async init() {
+        await this.db.init();
+        
+        // Load Extensions
+        await this.db.execute("INSTALL vss; LOAD vss;");
+        
+        await this.schema.ensureSchema();
+        
+        // If we are in time-travel mode, we might skip hydration or hydrate a snapshot (Advanced).
+        // For V1, we always hydrate "Current Active" topology.
+        try {
+          await this.hydrate();
+        } catch (e) {
+          console.error("Failed to hydrate graph topology from disk:", e);
+          // We don't throw here to allow partial functionality (metadata queries) if needed,
+          // but usually this is fatal for graph operations.
+          throw e;
+        }
+      }
+
+      /**
+       * Hydrates the in-memory Rust graph from the persistent DuckDB storage.
+       * This is critical for the "Split-Brain" architecture.
+       */
+      async hydrate() {
+        // V2 Implementation: Arrow IPC Zero-Copy
+        // We fetch the edges as a raw buffer.
+        // Note: 'valid_to IS NULL' ensures we only load currently active edges.
+        try {
+          const ipcBuffer = await this.db.queryArrow(
+            "SELECT source, target, type FROM edges WHERE valid_to IS NULL"
+          );
+        
+          if (ipcBuffer && ipcBuffer.length > 0) {
+             // In Node environment, we might need Buffer.from
+             // In Bun, Uint8Array is often sufficient or compatible.
+             // We assume native.loadArrowIpc handles the buffer.
+             this.native.loadArrowIpc(ipcBuffer as any);
+          }
+        } catch (e: any) {
+          throw new Error(`Hydration Error: ${e.message}`);
+        }
+      }
+
+      asOf(date: Date): QuackGraph {
+        // Return a shallow copy with new context
+        const g = new QuackGraph(this.db['path'], { asOf: date });
+        // Share the same DB connection and Native index (assuming topology is shared/latest)
+        g.db = this.db;
+        g.schema = this.schema;
+        g.native = this.native;
+        return g;
+      }
+
+      // --- Write Operations (Write-Through) ---
+
+      async addNode(id: string, labels: string[], props: Record<string, any> = {}) {
+        // 1. Write to Disk (Source of Truth)
+        await this.schema.writeNode(id, labels, props);
+        // 2. Write to RAM (Cache)
+        this.native.addNode(id);
+      }
+
+      async addEdge(source: string, target: string, type: string, props: Record<string, any> = {}) {
+        // 1. Write to Disk
+        await this.schema.writeEdge(source, target, type, props);
+        // 2. Write to RAM
+        this.native.addEdge(source, target, type);
+      }
+
+      // --- Optimization & Maintenance ---
+
+      get optimize() {
+        return {
+          promoteProperty: async (label: string, property: string, type: string) => {
+            await this.schema.promoteNodeProperty(label, property, type);
+          },
+        };
+      }
+
+      // --- Read Operations ---
+
+      match(labels: string[]): QueryBuilder {
+        return new QueryBuilder(this, labels);
+      }
+    }
+  packages/quack-graph/src/query.ts: |-
+    import { QuackGraph } from './graph';
+
+    type TraversalStep = {
+      type: 'out' | 'in';
+      edge: string;
+    };
+
+    export class QueryBuilder {
+      private graph: QuackGraph;
+      private startLabels: string[];
+      private endLabels: string[] = [];
+
+      // Bottom Bun Filters (Initial selection)
+      private initialFilters: Record<string, any> = {};
+      private vectorSearch: { vector: number[]; limit: number } | null = null;
+
+      // The Meat (Traversal)
+      private traversals: TraversalStep[] = [];
+
+      // Top Bun Filters (Final selection)
+      private terminalFilters: Record<string, any> = {};
+
+      constructor(graph: QuackGraph, labels: string[]) {
+        this.graph = graph;
+        this.startLabels = labels;
+      }
+
+      /**
+       * Filter nodes by properties.
+       * If called before traversal, applies to Start Nodes.
+       * If called after traversal, applies to End Nodes.
+       */
+      where(criteria: Record<string, any>): this {
+        if (this.traversals.length === 0) {
+          this.initialFilters = { ...this.initialFilters, ...criteria };
+        } else {
+          this.terminalFilters = { ...this.terminalFilters, ...criteria };
+        }
+        return this;
+      }
+
+      /**
+       * Perform a Vector Similarity Search (HNSW).
+       * This effectively sorts the start nodes by distance to the query vector.
+       */
+      nearText(vector: number[], options: { limit?: number } = {}): this {
+        this.vectorSearch = { 
+          vector, 
+          limit: options.limit || 10 
+        };
+        return this;
+      }
+
+      out(edgeType: string): this {
+        this.traversals.push({ type: 'out', edge: edgeType });
+        return this;
+      }
+
+      /**
+       * Filter the nodes at the end of the traversal by label.
+       */
+      node(labels: string[]): this {
+        this.endLabels = labels;
+        return this;
+      }
+
+      /**
+       * Helper to construct the temporal validity clause
+       */
+      private getTemporalClause(tableAlias: string = ''): string {
+        const prefix = tableAlias ? `${tableAlias}.` : '';
+        if (this.graph.context.asOf) {
+          // Time Travel: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+          // We pass the timestamp as a parameter later, or interpolate strict ISO string
+          const iso = this.graph.context.asOf.toISOString();
+          return `${prefix}valid_from <= '${iso}' AND (${prefix}valid_to > '${iso}' OR ${prefix}valid_to IS NULL)`;
+        }
+        // Default: Current valid records (valid_to is NULL)
+        return `${prefix}valid_to IS NULL`;
+      }
+
+      async select<T = any>(mapper?: (node: any) => T): Promise<T[]> {
+        // --- Step 1: DuckDB Filter (Bottom Bun) ---
+        // Objective: Get a list of "Active" Node IDs to feed into the graph.
+
+        let query = `SELECT id FROM nodes`;
+        const params: any[] = [];
+        const conditions: string[] = [];
+
+        // 1.a Temporal Filter
+        conditions.push(this.getTemporalClause());
+
+        // 1.b Label Filter
+        if (this.startLabels.length > 0) {
+          // Check if ANY of the labels match. For V1 we check the first one or intersection.
+          conditions.push(`list_contains(labels, ?)`);
+          params.push(this.startLabels[0]);
+        }
+
+        // 1.c Property Filter
+        for (const [key, value] of Object.entries(this.initialFilters)) {
+          conditions.push(`json_extract(properties, '$.${key}') = ?`);
+          params.push(value);
+        }
+
+        // 1.d Vector Search (Order By Distance)
+        let orderBy = '';
+        let limit = '';
+        if (this.vectorSearch) {
+          // Requires: array_distance(embedding, [1,2,3])
+          // DuckDB VSS extension syntax
+          const vectorStr = `[${this.vectorSearch.vector.join(',')}]`; // Inline vector for V1
+          orderBy = `ORDER BY array_distance(embedding, ${vectorStr}::FLOAT[${this.vectorSearch.vector.length}])`;
+          limit = `LIMIT ${this.vectorSearch.limit}`;
+        }
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` ${orderBy} ${limit}`;
+
+        const startRows = await this.graph.db.query(query, params);
+        let currentIds: string[] = startRows.map(row => row.id);
+
+        if (currentIds.length === 0) return [];
+
+        // --- Step 2: Rust Traversal (The Meat) ---
+        // Note: Rust Graph Index is currently "Latest Topology Only". 
+        // Time Travel on topology requires checking edge validity during traversal (V2).
+        // For V1, we accept that traversal is instant/current, but properties are historical.
+
+        for (const step of this.traversals) {
+          if (currentIds.length === 0) break;
+          // step.type is 'out' | 'in'
+          // native.traverse(ids, edgeType, direction)
+          currentIds = this.graph.native.traverse(currentIds, step.edge, step.type);
+        }
+
+        // --- Step 3: DuckDB Hydration (Top Bun) ---
+        // Objective: Fetch full properties for the resulting IDs, applying terminal filters.
+
+        if (currentIds.length === 0) return [];
+
+        const finalConditions: string[] = [];
+        const finalParams: any[] = [];
+
+        // 3.0 Label Filter (for End Nodes)
+        if (this.endLabels.length > 0) {
+          finalConditions.push(`list_contains(labels, ?)`);
+          finalParams.push(this.endLabels[0]);
+        }
+
+        // 3.a IDs match
+        // We can't use parameters for IN clause effectively with dynamic length in all drivers.
+        // Constructing placeholders.
+        const placeholders = currentIds.map(() => '?').join(',');
+        finalConditions.push(`id IN (${placeholders})`);
+        finalParams.push(...currentIds);
+
+        // 3.b Temporal Validity
+        finalConditions.push(this.getTemporalClause());
+
+        // 3.c Terminal Property Filters
+        for (const [key, value] of Object.entries(this.terminalFilters)) {
+          finalConditions.push(`json_extract(properties, '$.${key}') = ?`);
+          finalParams.push(value);
+        }
+
+        const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join(' AND ')}`;
+        const results = await this.graph.db.query(finalSql, finalParams);
+
+        return results.map(r => {
+          let props = r.properties;
+          if (typeof props === 'string') {
+            try { props = JSON.parse(props); } catch {}
+          }
+          const node = {
+            id: r.id,
+            labels: r.labels,
+            ...props
+          };
+          return mapper ? mapper(node) : node;
+        });
+      }
+    }
+approved: true
+linesAdded: 136
+linesRemoved: 53
+linesDifference: 189
+gitCommittedAt: '2025-12-02T08:54:09.577Z'
+status: committed
+id: 11

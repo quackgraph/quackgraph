@@ -39,6 +39,7 @@
       "LICENSE",
       ".gitignore",
       "tsconfig.tsbuildinfo",
+"packages/quack-graph/dist",
 //	"test/",
 	"test-docs/",
 //        "test/e2e/",

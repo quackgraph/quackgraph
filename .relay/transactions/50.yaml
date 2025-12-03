@@ -1,0 +1,906 @@
+uuid: b0d7f2a1-3c9e-4e8a-9f1b-2d5c8a6e7b1f
+projectId: quackgraph
+createdAt: '2025-12-02T14:29:32.696Z'
+gitCommitMsg: >-
+  fix: resolve rust clippy errors and duckdb vector search type mismatch
+
+  - Updated matcher.rs to use `is_some_and` to satisfy clippy. - Updated
+  query.ts to cast vector literals to `FLOAT[]` instead of fixed size array to
+  match column schema. - Added biome ignore rules for explicit any in generic
+  mergeNode functions.
+promptSummary: >-
+  Fixed Rust Clippy errors in matcher.rs (map_or -> is_some_and), fixed DuckDB
+  SQL generation type mismatch for vector search in query.ts, and suppressed
+  Biome 'noExplicitAny' lints in graph/schema files.
+reasoning:
+  - >-
+    Step 1: Fix Rust Clippy warnings in `matcher.rs` to allow successful
+    compilation.
+  - >-
+    Step 2: Fix DuckDB Vector Search SQL generation in `query.ts`. The error
+    indicated a type mismatch between `FLOAT[]` (column) and `FLOAT[3]` (literal
+    cast). Using `FLOAT[]` for the literal matches the column definition.
+  - 'Step 3: Fix Biome lints (noExplicitAny) in `graph.ts`.'
+  - 'Step 4: Fix Biome lints (noExplicitAny) in `schema.ts`.'
+operations:
+  - type: write
+    path: crates/quack_core/src/matcher.rs
+    content: >
+      --- crates/quack_core/src/matcher.rs
+
+      +++ crates/quack_core/src/matcher.rs
+
+      @@ -77,7 +77,7 @@
+                       let known_node = assignment[edge.src_var].unwrap();
+                       let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Outgoing);
+                       candidates = self.intersect(candidates, neighbors);
+      -                if candidates.as_ref().map_or(false, |c| c.is_empty()) {
+      return; }
+
+      +                if candidates.as_ref().is_some_and(|c| c.is_empty()) {
+      return; }
+                   }
+                   else if edge.src_var == current_var && edge.tgt_var < current_var {
+                       let known_node = assignment[edge.tgt_var].unwrap();
+                       let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Incoming);
+                       candidates = self.intersect(candidates, neighbors);
+      -                if candidates.as_ref().map_or(false, |c| c.is_empty()) {
+      return; }
+
+      +                if candidates.as_ref().is_some_and(|c| c.is_empty()) {
+      return; }
+                   }
+               }
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/query.ts
+    content: >
+      --- packages/quack-graph/src/query.ts
+
+      +++ packages/quack-graph/src/query.ts
+
+      @@ -190,5 +190,5 @@
+             // DuckDB VSS extension syntax
+             const vectorStr = `[${this.vectorSearch.vector.join(',')}]`; // Inline vector for V1
+      -      orderBy = `ORDER BY array_distance(embedding,
+      ${vectorStr}::FLOAT[${this.vectorSearch.vector.length}])`;
+
+      +      orderBy = `ORDER BY array_distance(embedding,
+      ${vectorStr}::FLOAT[])`;
+             limit = `LIMIT ${this.vectorSearch.limit}`;
+           }
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/graph.ts
+    content: >
+      --- packages/quack-graph/src/graph.ts
+
+      +++ packages/quack-graph/src/graph.ts
+
+      @@ -145,5 +145,6 @@
+          * @param setProps Properties to set/update if found or created.
+          */
+      -  async mergeNode(label: string, matchProps: Record<string, any>,
+      setProps: Record<string, any> = {}) {
+
+      +  // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
+
+      +  async mergeNode(label: string, matchProps: Record<string, any>,
+      setProps: Record<string, any> = {}) {
+           const id = await this.schema.mergeNode(label, matchProps, setProps);
+           // Update cache
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/schema.ts
+    content: >
+      --- packages/quack-graph/src/schema.ts
+
+      +++ packages/quack-graph/src/schema.ts
+
+      @@ -126,5 +126,6 @@
+          * Returns the node ID.
+          */
+      -  async mergeNode(label: string, matchProps: Record<string, any>,
+      setProps: Record<string, any>): Promise<string> {
+
+      +  // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
+
+      +  async mergeNode(label: string, matchProps: Record<string, any>,
+      setProps: Record<string, any>): Promise<string> {
+           // 1. Build Search Query
+           const matchKeys = Object.keys(matchProps);
+      @@ -148,4 +149,5 @@
+             let id: string;
+      +      // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
+             let finalProps: Record<string, any>;
+             let finalLabels: string[];
+    patchStrategy: standard-diff
+snapshot:
+  crates/quack_core/src/matcher.rs: >-
+    use crate::topology::{GraphIndex, Direction};
+
+    use std::collections::HashSet;
+
+
+    #[derive(Debug, Clone)]
+
+    pub struct PatternEdge {
+        pub src_var: usize,
+        pub tgt_var: usize,
+        pub type_id: u8,
+        pub direction: Direction,
+    }
+
+
+    /// A simple backtracking solver for subgraph isomorphism.
+
+    /// Finds all assignments of graph nodes to pattern variables such that all
+    pattern edges exist.
+
+    ///
+
+    /// Assumptions:
+
+    /// 1. Variable 0 is the "start" variable, seeded by `start_candidates`.
+
+    /// 2. The pattern is connected: for any variable `i > 0`, there is at least
+    one constraint
+
+    ///    connecting it to a variable `j < i`.
+
+    pub struct Matcher<'a> {
+        graph: &'a GraphIndex,
+        pattern: &'a [PatternEdge],
+        num_vars: usize,
+    }
+
+
+    impl<'a> Matcher<'a> {
+        pub fn new(graph: &'a GraphIndex, pattern: &'a [PatternEdge]) -> Self {
+            let mut max_var = 0;
+            for e in pattern {
+                max_var = max_var.max(e.src_var).max(e.tgt_var);
+            }
+            Self {
+                graph,
+                pattern,
+                num_vars: max_var + 1,
+            }
+        }
+
+        pub fn find_matches(&self, start_candidates: &[u32]) -> Vec<Vec<u32>> {
+            let mut results = Vec::new();
+            let mut assignment = vec![None; self.num_vars];
+            let mut used_nodes = HashSet::new();
+
+            for &start_node in start_candidates {
+                if self.graph.is_node_deleted(start_node) {
+                    continue;
+                }
+
+                assignment[0] = Some(start_node);
+                used_nodes.insert(start_node);
+                
+                self.backtrack(1, &mut assignment, &mut used_nodes, &mut results);
+                
+                used_nodes.remove(&start_node);
+                assignment[0] = None;
+            }
+
+            results
+        }
+
+        fn backtrack(
+            &self,
+            current_var: usize,
+            assignment: &mut Vec<Option<u32>>,
+            used_nodes: &mut HashSet<u32>,
+            results: &mut Vec<Vec<u32>>,
+        ) {
+            if current_var == self.num_vars {
+                results.push(assignment.iter().map(|opt| opt.unwrap()).collect());
+                return;
+            }
+
+            let mut candidates: Option<Vec<u32>> = None;
+
+            for edge in self.pattern {
+                if edge.src_var < current_var && edge.tgt_var == current_var {
+                    let known_node = assignment[edge.src_var].unwrap();
+                    let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Outgoing);
+                    candidates = self.intersect(candidates, neighbors);
+                    if candidates.as_ref().map_or(false, |c| c.is_empty()) { return; }
+                }
+                else if edge.src_var == current_var && edge.tgt_var < current_var {
+                    let known_node = assignment[edge.tgt_var].unwrap();
+                    let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Incoming);
+                    candidates = self.intersect(candidates, neighbors);
+                    if candidates.as_ref().map_or(false, |c| c.is_empty()) { return; }
+                }
+            }
+            
+            if let Some(cands) = candidates {
+                for cand in cands {
+                    if !used_nodes.contains(&cand) {
+                        assignment[current_var] = Some(cand);
+                        used_nodes.insert(cand);
+                        
+                        self.backtrack(current_var + 1, assignment, used_nodes, results);
+                        
+                        used_nodes.remove(&cand);
+                        assignment[current_var] = None;
+                    }
+                }
+            }
+        }
+
+        fn intersect(&self, current: Option<Vec<u32>>, next: Vec<u32>) -> Option<Vec<u32>> {
+            match current {
+                None => Some(next),
+                Some(curr) => {
+                    let set: HashSet<_> = next.into_iter().collect();
+                    Some(curr.into_iter().filter(|id| set.contains(id)).collect())
+                }
+            }
+        }
+    }
+  packages/quack-graph/src/query.ts: |-
+    import type { QuackGraph } from './graph';
+
+    type TraversalStep = {
+      type: 'out' | 'in' | 'recursive';
+      edge: string;
+      direction?: 'out' | 'in';
+      bounds?: { min: number; max: number };
+    };
+
+    export class QueryBuilder {
+      private graph: QuackGraph;
+      private startLabels: string[];
+      private endLabels: string[] = [];
+
+      // Bottom Bun Filters (Initial selection)
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      private initialFilters: Record<string, any> = {};
+      private vectorSearch: { vector: number[]; limit: number } | null = null;
+
+      // The Meat (Traversal)
+      private traversals: TraversalStep[] = [];
+
+      // Top Bun Filters (Final selection)
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      private terminalFilters: Record<string, any> = {};
+
+      private aggState = {
+        groupBy: [] as string[],
+        orderBy: [] as { field: string; dir: 'ASC' | 'DESC' }[],
+        limit: undefined as number | undefined,
+        offset: undefined as number | undefined,
+      };
+
+      constructor(graph: QuackGraph, labels: string[]) {
+        this.graph = graph;
+        this.startLabels = labels;
+      }
+
+      /**
+       * Traverses the graph recursively (BFS) with depth bounds.
+       * Useful for variable length paths like `(a)-[:KNOWS*1..5]->(b)`.
+       * @param edgeType The edge label to follow.
+       * @param options min/max depth (default: 1..5).
+       * @param direction 'out' (default) or 'in'.
+       */
+      recursive(edgeType: string, options: { min?: number; max?: number } = {}, direction: 'out' | 'in' = 'out'): this {
+        this.traversals.push({
+          type: 'recursive',
+          edge: edgeType,
+          direction,
+          bounds: {
+            min: options.min ?? 1,
+            max: options.max ?? 5,
+          }
+        });
+        return this;
+      }
+
+      /**
+       * Filter nodes by properties.
+       * If called before traversal, applies to Start Nodes.
+       * If called after traversal, applies to End Nodes.
+       */
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      where(criteria: Record<string, any>): this {
+        if (this.traversals.length === 0) {
+          this.initialFilters = { ...this.initialFilters, ...criteria };
+        } else {
+          this.terminalFilters = { ...this.terminalFilters, ...criteria };
+        }
+        return this;
+      }
+
+      /**
+       * Perform a Vector Similarity Search (HNSW).
+       * This effectively sorts the start nodes by distance to the query vector.
+       */
+      nearText(vector: number[], options: { limit?: number } = {}): this {
+        this.vectorSearch = { 
+          vector, 
+          limit: options.limit || 10 
+        };
+        return this;
+      }
+
+      out(edgeType: string): this {
+        this.traversals.push({ type: 'out', edge: edgeType });
+        return this;
+      }
+
+      in(edgeType: string): this {
+        this.traversals.push({ type: 'in', edge: edgeType });
+        return this;
+      }
+
+      groupBy(field: string): this {
+        this.aggState.groupBy.push(field);
+        return this;
+      }
+
+      orderBy(field: string, dir: 'ASC' | 'DESC' = 'ASC'): this {
+        this.aggState.orderBy.push({ field, dir });
+        return this;
+      }
+
+      limit(n: number): this {
+        this.aggState.limit = n;
+        return this;
+      }
+
+      offset(n: number): this {
+        this.aggState.offset = n;
+        return this;
+      }
+
+      /**
+       * Filter the nodes at the end of the traversal by label.
+       */
+      node(labels: string[]): this {
+        this.endLabels = labels;
+        return this;
+      }
+
+      /**
+       * Helper to construct the temporal validity clause
+       */
+      private getTemporalClause(tableAlias: string = ''): string {
+        const prefix = tableAlias ? `${tableAlias}.` : '';
+        if (this.graph.context.asOf) {
+          // Time Travel: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+          // Interpolate strict ISO string
+          const iso = this.graph.context.asOf.toISOString();
+          // DuckDB TIMESTAMP comparison works with ISO strings
+          return `(${prefix}valid_from <= '${iso}' AND (${prefix}valid_to > '${iso}' OR ${prefix}valid_to IS NULL))`;
+        }
+        // Default: Current valid records (valid_to is NULL)
+        return `${prefix}valid_to IS NULL`;
+      }
+
+      /**
+       * Executes the query.
+       * @param projection Optional SQL projection string (e.g., 'count(*), avg(properties->>age)') or a JS mapper function.
+       */
+      // biome-ignore lint/suspicious/noExplicitAny: Generic result mapper
+      async select<T = any>(projection?: string | ((node: any) => T)): Promise<T[]> {
+        const isRawSql = typeof projection === 'string';
+        const mapper = typeof projection === 'function' ? projection : undefined;
+
+        // --- Step 1: DuckDB Filter (Bottom Bun) ---
+        // Objective: Get a list of "Active" Node IDs to feed into the graph.
+
+        let query = `SELECT id FROM nodes`;
+        // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+        const params: any[] = [];
+        const conditions: string[] = [];
+
+        // 1.a Temporal Filter
+        conditions.push(this.getTemporalClause());
+
+        // 1.b Label Filter
+        if (this.startLabels.length > 0) {
+          // Check if ANY of the labels match. For V1 we check the first one or intersection.
+          conditions.push(`list_contains(labels, ?)`);
+          params.push(this.startLabels[0]);
+        }
+
+        // 1.c Property Filter
+        for (const [key, value] of Object.entries(this.initialFilters)) {
+          if (key === 'id') {
+            conditions.push(`id = ?`);
+            params.push(value);
+          } else {
+            conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+            params.push(JSON.stringify(value));
+          }
+        }
+
+        // 1.d Vector Search (Order By Distance)
+        let orderBy = '';
+        let limit = '';
+        if (this.vectorSearch) {
+          // Requires: array_distance(embedding, [1,2,3])
+          // DuckDB VSS extension syntax
+          const vectorStr = `[${this.vectorSearch.vector.join(',')}]`; // Inline vector for V1
+          orderBy = `ORDER BY array_distance(embedding, ${vectorStr}::FLOAT[${this.vectorSearch.vector.length}])`;
+          limit = `LIMIT ${this.vectorSearch.limit}`;
+        }
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` ${orderBy} ${limit}`;
+
+        const startRows = await this.graph.db.query(query, params);
+        let currentIds: string[] = startRows.map(row => row.id);
+
+        if (currentIds.length === 0) return [];
+
+        // --- Step 2: Rust Traversal (The Meat) ---
+        // Note: Rust Graph Index is currently "Latest Topology Only". 
+        // Time Travel on topology requires checking edge validity during traversal (V2).
+        // For V1, we accept that traversal is instant/current, but properties are historical.
+
+        for (const step of this.traversals) {
+          if (currentIds.length === 0) break;
+          
+          if (step.type === 'recursive') {
+            currentIds = this.graph.native.traverseRecursive(
+              currentIds,
+              step.edge,
+              step.direction || 'out',
+              step.bounds?.min,
+              step.bounds?.max
+            );
+          } else {
+            // step.type is 'out' | 'in'
+            currentIds = this.graph.native.traverse(currentIds, step.edge, step.type as 'out' | 'in');
+          }
+        }
+
+        // Optimization: If traversal resulted in no nodes, stop early.
+        if (currentIds.length === 0) return [];
+
+        // --- Step 3: DuckDB Hydration (Top Bun) ---
+        // Objective: Fetch full properties for the resulting IDs, applying terminal filters.
+
+        const finalConditions: string[] = [];
+        // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+        const finalParams: any[] = [];
+
+        // 3.0 Label Filter (for End Nodes)
+        if (this.endLabels.length > 0) {
+          finalConditions.push(`list_contains(labels, ?)`);
+          finalParams.push(this.endLabels[0]);
+        }
+
+        // 3.a IDs match
+        // We can't use parameters for IN clause effectively with dynamic length in all drivers.
+        // Constructing placeholders.
+        const placeholders = currentIds.map(() => '?').join(',');
+        finalConditions.push(`id IN (${placeholders})`);
+        finalParams.push(...currentIds);
+
+        // 3.b Temporal Validity
+        finalConditions.push(this.getTemporalClause());
+
+        // 3.c Terminal Property Filters
+        for (const [key, value] of Object.entries(this.terminalFilters)) {
+          if (key === 'id') {
+            finalConditions.push(`id = ?`);
+            finalParams.push(value);
+          } else {
+            finalConditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+            finalParams.push(JSON.stringify(value));
+          }
+        }
+
+        // 3.d Aggregation / Grouping / Ordering
+        let selectClause = 'SELECT *';
+        if (isRawSql) {
+          selectClause = `SELECT ${projection}`;
+        }
+
+        let suffix = '';
+        if (this.aggState.groupBy.length > 0) {
+          suffix += ` GROUP BY ${this.aggState.groupBy.join(', ')}`;
+        }
+        
+        if (this.aggState.orderBy.length > 0) {
+          const orders = this.aggState.orderBy.map(o => `${o.field} ${o.dir}`).join(', ');
+          suffix += ` ORDER BY ${orders}`;
+        }
+
+        if (this.aggState.limit !== undefined) {
+          suffix += ` LIMIT ${this.aggState.limit}`;
+        }
+        if (this.aggState.offset !== undefined) {
+          suffix += ` OFFSET ${this.aggState.offset}`;
+        }
+
+        const finalSql = `${selectClause} FROM nodes WHERE ${finalConditions.join(' AND ')} ${suffix}`;
+        const results = await this.graph.db.query(finalSql, finalParams);
+
+        return results.map(r => {
+          if (isRawSql) return r;
+
+          let props = r.properties;
+          if (typeof props === 'string') {
+            try { props = JSON.parse(props); } catch {}
+          }
+          const node = {
+            id: r.id,
+            labels: r.labels,
+            ...props
+          };
+          return mapper ? mapper(node) : node;
+        });
+      }
+    }
+  packages/quack-graph/src/graph.ts: |-
+    import { NativeGraph } from '@quackgraph/native';
+    import { DuckDBManager } from './db';
+    import { SchemaManager } from './schema';
+    import { QueryBuilder } from './query';
+
+    export class QuackGraph {
+      db: DuckDBManager;
+      schema: SchemaManager;
+      native: NativeGraph;
+      
+      capabilities = {
+        vss: false
+      };
+
+      // Context for the current instance (Time Travel)
+      context: {
+        asOf?: Date;
+        topologySnapshot?: string;
+      } = {};
+
+      constructor(path: string = ':memory:', options: { asOf?: Date, topologySnapshot?: string } = {}) {
+        this.db = new DuckDBManager(path);
+        this.schema = new SchemaManager(this.db);
+        this.native = new NativeGraph();
+        this.context.asOf = options.asOf;
+        this.context.topologySnapshot = options.topologySnapshot;
+      }
+
+      async init() {
+        await this.db.init();
+        
+        // Load Extensions
+        try {
+          await this.db.execute("INSTALL vss; LOAD vss;");
+          this.capabilities.vss = true;
+        } catch (e) {
+          console.warn("QuackGraph: Failed to load 'vss' extension. Vector search will be disabled.", e);
+        }
+        
+        await this.schema.ensureSchema();
+        
+        // If we are in time-travel mode, we might skip hydration or hydrate a snapshot (Advanced).
+        // For V1, we always hydrate "Current Active" topology.
+
+        // Check for Topology Snapshot
+        if (this.context.topologySnapshot) {
+          try {
+            // Try loading from disk
+            this.native.loadSnapshot(this.context.topologySnapshot);
+            // If successful, skip hydration
+            return;
+          } catch (e) {
+            console.warn(`QuackGraph: Failed to load snapshot '${this.context.topologySnapshot}'. Falling back to full hydration.`, e);
+          }
+        }
+
+        try {
+          await this.hydrate();
+        } catch (e) {
+          console.error("Failed to hydrate graph topology from disk:", e);
+          // We don't throw here to allow partial functionality (metadata queries) if needed,
+          // but usually this is fatal for graph operations.
+          throw e;
+        }
+      }
+
+      /**
+       * Hydrates the in-memory Rust graph from the persistent DuckDB storage.
+       * This is critical for the "Split-Brain" architecture.
+       */
+      async hydrate() {
+        // Zero-Copy Arrow IPC
+        // 'valid_to IS NULL' ensures we only load currently active edges.
+        try {
+          const ipcBuffer = await this.db.queryArrow(
+            "SELECT source, target, type FROM edges WHERE valid_to IS NULL"
+          );
+        
+          if (ipcBuffer && ipcBuffer.length > 0) {
+             // Napi-rs expects a Buffer or equivalent
+             // Buffer.from is zero-copy in Node for Uint8Array usually, or cheap copy
+             // We cast to any to satisfy the generated TS definitions which might expect Buffer
+             const bufferForNapi = Buffer.isBuffer(ipcBuffer) 
+                ? ipcBuffer 
+                : Buffer.from(ipcBuffer);
+                
+             this.native.loadArrowIpc(bufferForNapi);
+
+             // Reclaim memory after burst hydration
+             this.native.compact();
+          }
+        // biome-ignore lint/suspicious/noExplicitAny: error handling
+        } catch (e: any) {
+          throw new Error(`Hydration Error: ${e.message}`);
+        }
+      }
+
+      asOf(date: Date): QuackGraph {
+        // Return a shallow copy with new context
+        const g = new QuackGraph(this.db.path, { asOf: date });
+        // Share the same DB connection and Native index (assuming topology is shared/latest)
+        g.db = this.db;
+        g.schema = this.schema;
+        g.native = this.native;
+        g.capabilities = { ...this.capabilities };
+        return g;
+      }
+
+      // --- Write Operations (Write-Through) ---
+
+      // biome-ignore lint/suspicious/noExplicitAny: generic properties
+      async addNode(id: string, labels: string[], props: Record<string, any> = {}) {
+        // 1. Write to Disk (Source of Truth)
+        await this.schema.writeNode(id, labels, props);
+        // 2. Write to RAM (Cache)
+        this.native.addNode(id);
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: generic properties
+      async addEdge(source: string, target: string, type: string, props: Record<string, any> = {}) {
+        // 1. Write to Disk
+        await this.schema.writeEdge(source, target, type, props);
+        // 2. Write to RAM
+        this.native.addEdge(source, target, type);
+      }
+
+      async deleteNode(id: string) {
+        // 1. Write to Disk (Soft Delete)
+        await this.schema.deleteNode(id);
+        // 2. Write to RAM (Tombstone)
+        this.native.removeNode(id);
+      }
+
+      async deleteEdge(source: string, target: string, type: string) {
+        // 1. Write to Disk (Soft Delete)
+        await this.schema.deleteEdge(source, target, type);
+        // 2. Write to RAM (Remove)
+        this.native.removeEdge(source, target, type);
+      }
+
+      /**
+       * Upsert a node.
+       * @param label Primary label to match.
+       * @param matchProps Properties to match against (e.g. { email: '...' }).
+       * @param setProps Properties to set/update if found or created.
+       */
+      async mergeNode(label: string, matchProps: Record<string, any>, setProps: Record<string, any> = {}) {
+        const id = await this.schema.mergeNode(label, matchProps, setProps);
+        // Update cache
+        this.native.addNode(id);
+        return id;
+      }
+
+      // --- Optimization & Maintenance ---
+
+      get optimize() {
+        return {
+          promoteProperty: async (label: string, property: string, type: string) => {
+            await this.schema.promoteNodeProperty(label, property, type);
+          },
+          saveTopologySnapshot: (path: string) => {
+            this.native.saveSnapshot(path);
+          }
+        };
+      }
+
+      // --- Read Operations ---
+
+      match(labels: string[]): QueryBuilder {
+        return new QueryBuilder(this, labels);
+      }
+    }
+  packages/quack-graph/src/schema.ts: |-
+    import type { DuckDBManager, DbExecutor } from './db';
+
+    const NODES_TABLE = `
+    CREATE TABLE IF NOT EXISTS nodes (
+        row_id UBIGINT PRIMARY KEY, -- Simple auto-increment equivalent logic handled by sequence
+        id TEXT NOT NULL,
+        labels TEXT[],
+        properties JSON,
+        embedding FLOAT[], -- Vector embedding
+        valid_from TIMESTAMPTZ DEFAULT current_timestamp,
+        valid_to TIMESTAMPTZ DEFAULT NULL
+    );
+    CREATE SEQUENCE IF NOT EXISTS seq_node_id;
+    `;
+
+    const EDGES_TABLE = `
+    CREATE TABLE IF NOT EXISTS edges (
+        source TEXT NOT NULL,
+        target TEXT NOT NULL,
+        type TEXT NOT NULL,
+        properties JSON,
+        valid_from TIMESTAMPTZ DEFAULT current_timestamp,
+        valid_to TIMESTAMPTZ DEFAULT NULL
+    );
+    `;
+
+    export class SchemaManager {
+      constructor(private db: DuckDBManager) {}
+
+      async ensureSchema() {
+        await this.db.execute(NODES_TABLE);
+        await this.db.execute(EDGES_TABLE);
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: generic properties
+      async writeNode(id: string, labels: string[], properties: Record<string, any> = {}) {
+        await this.db.transaction(async (tx: DbExecutor) => {
+          // 1. Close existing record (SCD Type 2)
+          await tx.execute(
+            `UPDATE nodes SET valid_to = current_timestamp WHERE id = ? AND valid_to IS NULL`,
+            [id]
+          );
+          // 2. Insert new version
+          await tx.execute(`
+            INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
+            VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, current_timestamp, NULL)
+          `, [id, JSON.stringify(labels), JSON.stringify(properties)]);
+        });
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: generic properties
+      async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}) {
+        await this.db.transaction(async (tx: DbExecutor) => {
+          // 1. Close existing edge
+          await tx.execute(
+            `UPDATE edges SET valid_to = current_timestamp WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+            [source, target, type]
+          );
+          // 2. Insert new version
+          await tx.execute(`
+            INSERT INTO edges (source, target, type, properties, valid_from, valid_to) 
+            VALUES (?, ?, ?, ?::JSON, current_timestamp, NULL)
+          `, [source, target, type, JSON.stringify(properties)]);
+        });
+      }
+
+      async deleteNode(id: string) {
+        // Soft Delete: Close the validity period
+        await this.db.transaction(async (tx: DbExecutor) => {
+          await tx.execute(
+            `UPDATE nodes SET valid_to = current_timestamp WHERE id = ? AND valid_to IS NULL`,
+            [id]
+          );
+        });
+      }
+
+      async deleteEdge(source: string, target: string, type: string) {
+        // Soft Delete: Close the validity period
+        await this.db.transaction(async (tx: DbExecutor) => {
+          await tx.execute(
+            `UPDATE edges SET valid_to = current_timestamp WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+            [source, target, type]
+          );
+        });
+      }
+
+      /**
+       * Promotes a JSON property to a native column for faster filtering.
+       * This creates a column on the `nodes` table and backfills it from the `properties` JSON blob.
+       * 
+       * @param label The node label to target (e.g., 'User'). Only nodes with this label will be updated.
+       * @param property The property key to promote (e.g., 'age').
+       * @param type The DuckDB SQL type (e.g., 'INTEGER', 'VARCHAR').
+       */
+      async promoteNodeProperty(label: string, property: string, type: string) {
+        // Sanitize inputs to prevent basic SQL injection (rudimentary check)
+        if (!/^[a-zA-Z0-9_]+$/.test(property)) throw new Error(`Invalid property name: '${property}'. Must be alphanumeric + underscore.`);
+        // Type check is looser to allow various SQL types, but strictly alphanumeric + spaces/parens usually safe enough for now
+        if (!/^[a-zA-Z0-9_() ]+$/.test(type)) throw new Error(`Invalid SQL type: '${type}'.`);
+        // Sanitize label just in case, though it is used as a parameter usually, here we might need dynamic check if we were using it in table names, but we use it in list_contains param.
+        
+        // 1. Add Column (Idempotent)
+        try {
+          // Note: DuckDB 0.9+ supports ADD COLUMN IF NOT EXISTS
+          await this.db.execute(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ${property} ${type}`);
+        } catch (_e) {
+          // Fallback or ignore if column exists
+        }
+
+        // 2. Backfill Data
+        // We use list_contains to only update relevant nodes
+        const sql = `
+          UPDATE nodes 
+          SET ${property} = CAST(json_extract(properties, '$.${property}') AS ${type})
+          WHERE list_contains(labels, ?)
+        `;
+        await this.db.execute(sql, [label]);
+      }
+
+      /**
+       * Declarative Merge (Upsert).
+       * Finds a node by `matchProps` and `label`.
+       * If found: Updates properties with `setProps`.
+       * If not found: Creates new node with `matchProps` + `setProps`.
+       * Returns the node ID.
+       */
+      async mergeNode(label: string, matchProps: Record<string, any>, setProps: Record<string, any>): Promise<string> {
+        // 1. Build Search Query
+        const matchKeys = Object.keys(matchProps);
+        const conditions = [`valid_to IS NULL`, `list_contains(labels, ?)`];
+        // biome-ignore lint/suspicious/noExplicitAny: Params array
+        const params: any[] = [label];
+        
+        for (const key of matchKeys) {
+          if (key === 'id') {
+            conditions.push(`id = ?`);
+            params.push(matchProps[key]);
+          } else {
+            conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+            params.push(JSON.stringify(matchProps[key]));
+          }
+        }
+
+        const searchSql = `SELECT id, labels, properties FROM nodes WHERE ${conditions.join(' AND ')} LIMIT 1`;
+
+        return await this.db.transaction(async (tx) => {
+          const rows = await tx.query(searchSql, params);
+          let id: string;
+          let finalProps: Record<string, any>;
+          let finalLabels: string[];
+
+          if (rows.length > 0) {
+            // Update Existing
+            const row = rows[0];
+            id = row.id;
+            const currentProps = typeof row.properties === 'string' ? JSON.parse(row.properties) : row.properties;
+            finalProps = { ...currentProps, ...setProps };
+            finalLabels = row.labels; // Preserve existing labels
+
+            // Close old version
+            await tx.execute(`UPDATE nodes SET valid_to = current_timestamp WHERE id = ? AND valid_to IS NULL`, [id]);
+          } else {
+            // Insert New
+            id = matchProps.id || crypto.randomUUID();
+            finalProps = { ...matchProps, ...setProps };
+            finalLabels = [label];
+          }
+
+          // Insert new version (for both Update and Create cases)
+          await tx.execute(`
+            INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
+            VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, current_timestamp, NULL)
+          `, [id, JSON.stringify(finalLabels), JSON.stringify(finalProps)]);
+
+          return id;
+        });
+      }
+    }
+approved: true
+linesAdded: 6
+linesRemoved: 3
+linesDifference: 9
+gitCommittedAt: '2025-12-02T14:30:10.848Z'
+status: committed
+id: 50

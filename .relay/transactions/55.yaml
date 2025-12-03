@@ -1,0 +1,988 @@
+uuid: 1957591e-3985-48b5-9371-252554e7d482
+projectId: quackgraph
+createdAt: '2025-12-03T01:48:24.312Z'
+gitCommitMsg: 'feat(core): optimize bulk ingestion to O(1) with deferred deduplication'
+promptSummary: >-
+  Implemented 'Append-Then-Sort' strategy for bulk edge ingestion in Rust core
+  and added integration tests to verify deduplication behavior.
+reasoning:
+  - >-
+    To execute **Part 1: Turbocharged Bulk Ingestion**, I will modify the Rust
+    core to implement the "Append-Then-Sort" strategy for Arrow IPC ingestion
+    and update the compaction logic to handle deduplication. Then I will add
+    verification tests.
+  - '### Step 1: Optimize Topology in `crates/quack_core/src/topology.rs`'
+  - >-
+    I am updating `add_arrow_batch` to blindly push edges (O(1)) instead of
+    checking for existence (O(N)). I am also updating `compact` to sort and
+    deduplicate the adjacency lists, restoring graph integrity after bulk loads.
+  - '### Step 2: Native Layer Check (`packages/native/src/lib.rs`)'
+  - >-
+    The `load_arrow_ipc` function in `packages/native/src/lib.rs` correctly
+    delegates to `self.inner.add_arrow_batch(...)`. The TypeScript layer
+    (`packages/quack-graph/src/graph.ts`) explicitly calls
+    `this.native.compact()` after hydration. No changes are needed in
+    `packages/native/src/lib.rs` as the logic is encapsulated in `quack_core`,
+    but I will touch the file to ensure the build triggers if necessary and to
+    confirm the "Wire Native Layer" step. Actually, looking at the code, I can
+    verify the comment or just add a comment to enforce the requirement.
+  - '### Step 3: Verification Test in `test/integration/concurrency.test.ts`'
+  - >-
+    I'll add a test that explicitly injects duplicate edges into DuckDB and
+    verifies that the hydration + compaction process correctly results in unique
+    edges in the in-memory graph.
+  - '### Final Steps'
+  - >-
+    I have implemented the core logic changes for O(1) bulk ingestion and added
+    the necessary guardrails.
+operations:
+  - type: write
+    path: crates/quack_core/src/topology.rs
+    content: >
+      --- crates/quack_core/src/topology.rs
+
+      +++ crates/quack_core/src/topology.rs
+
+      @@ -48,8 +48,15 @@
+           /// Compacts internal vectors to minimize memory usage.
+      -    /// Should be called after bulk hydration.
+
+      +    /// Also sorts and deduplicates adjacency lists (essential after bulk
+      loading).
+
+      +    /// Should be called after bulk hydration.
+           pub fn compact(&mut self) {
+      +        self.outgoing.iter_mut().for_each(|v| {
+
+      +            v.sort_unstable();
+
+      +            v.dedup();
+
+      +            v.shrink_to_fit();
+
+      +        });
+
+      +        self.incoming.iter_mut().for_each(|v| {
+
+      +            v.sort_unstable();
+
+      +            v.dedup();
+
+      +            v.shrink_to_fit();
+
+      +        });
+               self.outgoing.shrink_to_fit();
+      -        self.outgoing.iter_mut().for_each(|v| v.shrink_to_fit());
+               self.incoming.shrink_to_fit();
+      -        self.incoming.iter_mut().for_each(|v| v.shrink_to_fit());
+               self.edge_type_vec.shrink_to_fit();
+           }
+       
+      @@ -211,7 +218,22 @@
+               let type_wrapper = get_wrapper!(type_col);
+       
+               for i in 0..num_rows {
+      -            self.add_edge(src_wrapper.value(i), tgt_wrapper.value(i),
+      type_wrapper.value(i));
+
+      +            let src = src_wrapper.value(i);
+
+      +            let tgt = tgt_wrapper.value(i);
+
+      +            let edge_type = type_wrapper.value(i);
+
+      +
+
+      +            let u_src = self.get_or_create_node(src);
+
+      +            let u_tgt = self.get_or_create_node(tgt);
+
+      +            let u_type = self.get_or_create_type(edge_type);
+
+      +
+
+      +            // Fast Path: Blind push. We rely on compact() to deduplicate
+      later.
+
+      +            self.outgoing[u_src as usize].push((u_tgt, u_type));
+
+      +            self.incoming[u_tgt as usize].push((u_src, u_type));
+
+      +
+
+      +            // Ensure nodes are not tombstoned (revival logic)
+
+      +            if self.tombstones.get(u_src as usize).as_deref() ==
+      Some(&true) {
+
+      +                self.tombstones.set(u_src as usize, false);
+
+      +            }
+
+      +            if self.tombstones.get(u_tgt as usize).as_deref() ==
+      Some(&true) {
+
+      +                self.tombstones.set(u_tgt as usize, false);
+
+      +            }
+               }
+               Ok(())
+           }
+      @@ -375,3 +397,36 @@
+           }
+       }
+      +
+
+      +#[cfg(test)]
+
+      +mod tests {
+
+      +    use super::*;
+
+      +
+
+      +    #[test]
+
+      +    fn test_bulk_add_dedup() {
+
+      +        let mut graph = GraphIndex::new();
+
+      +        
+
+      +        // Simulate batch loading with duplicates
+
+      +        // A -> B (KNOWS)
+
+      +        // A -> B (KNOWS)
+
+      +        // A -> B (LIKES)
+
+      +        
+
+      +        let u_a = graph.get_or_create_node("A");
+
+      +        let u_b = graph.get_or_create_node("B");
+
+      +        let t_knows = graph.get_or_create_type("KNOWS");
+
+      +        let t_likes = graph.get_or_create_type("LIKES");
+
+      +
+
+      +        // Manually push duplicates simulating blind batch add
+
+      +        graph.outgoing[u_a as usize].push((u_b, t_knows));
+
+      +        graph.outgoing[u_a as usize].push((u_b, t_knows)); // Duplicate
+
+      +        graph.outgoing[u_a as usize].push((u_b, t_likes)); // Different
+      type
+
+      +
+
+      +        // Pre-compact: 3 edges
+
+      +        assert_eq!(graph.outgoing[u_a as usize].len(), 3);
+
+      +
+
+      +        // Compact
+
+      +        graph.compact();
+
+      +
+
+      +        // Post-compact: 2 edges (KNOWS, LIKES)
+
+      +        assert_eq!(graph.outgoing[u_a as usize].len(), 2);
+
+      +        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_knows)));
+
+      +        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_likes)));
+
+      +    }
+
+      +}
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/native/src/lib.rs
+    content: >
+      --- packages/native/src/lib.rs
+
+      +++ packages/native/src/lib.rs
+
+      @@ -42,4 +42,5 @@
+           /// Hydrates the graph from an Arrow IPC stream (Buffer).
+           /// Zero-copy (mostly) data transfer from DuckDB.
+      +    /// Note: Does not verify duplicates. Caller must call compact()
+      afterwards.
+           #[napi]
+           pub fn load_arrow_ipc(&mut self, buffer: Buffer) -> napi::Result<()> {
+      @@ -53,4 +54,5 @@
+           /// Compacts the graph's memory usage.
+           /// Call this after hydration to reclaim unused capacity in the adjacency lists.
+      +    /// Also deduplicates edges added via bulk ingestion.
+           #[napi]
+           pub fn compact(&mut self) {
+    patchStrategy: standard-diff
+  - type: write
+    path: test/integration/concurrency.test.ts
+    content: >
+      --- test/integration/concurrency.test.ts
+
+      +++ test/integration/concurrency.test.ts
+
+      @@ -52,4 +52,36 @@
+           const neighbors = g.native.traverse(['A'], 'LINK_42', 'out');
+           expect(neighbors).toEqual(['B']);
+         });
+      +
+
+      +  test('should deduplicate edges during bulk hydration
+      (Append-Then-Sort)', async () => {
+
+      +    // This tests the optimized Arrow ingestion strategy
+
+      +    const setup = await createGraph('disk', 'int-bulk-dedup');
+
+      +    const g = setup.graph;
+
+      +    path = setup.path;
+
+      +
+
+      +    // 1. Manually insert duplicates into DuckDB (bypassing graph API
+      which might check)
+
+      +    // QuackGraph schema: edges(source, target, type, ...)
+
+      +    const sql = `
+
+      +      INSERT INTO edges (source, target, type, valid_from, valid_to)
+      VALUES 
+
+      +      ('src', 'tgt', 'KNOWS', current_timestamp, NULL),
+
+      +      ('src', 'tgt', 'KNOWS', current_timestamp, NULL), -- Duplicate
+
+      +      ('src', 'tgt', 'KNOWS', current_timestamp, NULL)  -- Triplicate
+
+      +    `;
+
+      +    await g.db.execute(sql);
+
+      +
+
+      +    // 2. Hydrate
+
+      +    // Re-initialize to trigger hydration from disk
+
+      +    // We use the same file path
+
+      +    await g.native.loadArrowIpc(
+
+      +      Buffer.from(await g.db.queryArrow("SELECT source, target, type FROM
+      edges WHERE valid_to IS NULL"))
+
+      +    );
+
+      +
+
+      +    // 3. Compact (Triggers Sort & Dedup)
+
+      +    g.native.compact();
+
+      +
+
+      +    // 4. Verify
+
+      +    // Should count as 1 edge in topology
+
+      +    // Note: If we didn't compact, this might be 3 depending on
+      implementation, but compact enforces uniqueness.
+
+      +    expect(g.native.edgeCount).toBe(1);
+
+      +    expect(g.native.traverse(['src'], 'KNOWS', 'out')).toEqual(['tgt']);
+
+      +  });
+       });
+    patchStrategy: standard-diff
+snapshot:
+  crates/quack_core/src/topology.rs: |-
+    use crate::interner::Interner;
+    use bitvec::prelude::*;
+    use std::collections::{HashMap, VecDeque};
+    use serde::{Serialize, Deserialize};
+    use std::fs::File;
+    use std::io::{BufReader, BufWriter};
+    use arrow::record_batch::RecordBatch;
+    use arrow::array::{AsArray, Array, StringArray, LargeStringArray};
+    use arrow::datatypes::DataType;
+    use arrow::compute::cast;
+
+    /// The core Graph Index.
+    /// Stores topology in RAM using integer IDs.
+    #[derive(Default, Debug, Serialize, Deserialize)]
+    pub struct GraphIndex {
+        node_interner: Interner,
+        
+        // Mapping edge type strings (e.g. "KNOWS") to u8 for compact storage.
+        // Limit: 256 edge types per graph in V1.
+        edge_type_map: HashMap<String, u8>,
+        edge_type_vec: Vec<String>,
+
+        // Forward Graph: Source Node ID -> List of (Target Node ID, Edge Type ID)
+        outgoing: Vec<Vec<(u32, u8)>>,
+        
+        // Reverse Graph: Target Node ID -> List of (Source Node ID, Edge Type ID)
+        incoming: Vec<Vec<(u32, u8)>>,
+
+        // Bitmask for soft-deleted nodes.
+        // true = deleted (tombstone), false = active.
+        tombstones: BitVec,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum Direction {
+        Outgoing,
+        Incoming,
+    }
+
+    impl GraphIndex {
+        pub fn new() -> Self {
+            Self {
+                node_interner: Interner::new(),
+                edge_type_map: HashMap::new(),
+                edge_type_vec: Vec::new(),
+                outgoing: Vec::new(),
+                incoming: Vec::new(),
+                tombstones: BitVec::new(),
+            }
+        }
+
+        pub fn lookup_id(&self, id: &str) -> Option<u32> {
+            self.node_interner.lookup_id(id)
+        }
+
+        pub fn lookup_str(&self, id: u32) -> Option<&str> {
+            self.node_interner.lookup(id)
+        }
+
+        /// Compacts internal vectors to minimize memory usage.
+        /// Should be called after bulk hydration.
+        pub fn compact(&mut self) {
+            self.outgoing.shrink_to_fit();
+            self.outgoing.iter_mut().for_each(|v| v.shrink_to_fit());
+            self.incoming.shrink_to_fit();
+            self.incoming.iter_mut().for_each(|v| v.shrink_to_fit());
+            self.edge_type_vec.shrink_to_fit();
+        }
+
+        /// Resolves or creates an internal u32 ID for a node string.
+        /// Resizes internal storage if necessary.
+        pub fn get_or_create_node(&mut self, id: &str) -> u32 {
+            let internal_id = self.node_interner.intern(id);
+            let idx = internal_id as usize;
+
+            // Ensure vectors are large enough to hold this node
+            if idx >= self.outgoing.len() {
+                let new_len = idx + 1;
+                self.outgoing.resize_with(new_len, Vec::new);
+                self.incoming.resize_with(new_len, Vec::new);
+                // Resize tombstones, filling new slots with false (active)
+                self.tombstones.resize(new_len, false);
+            }
+            internal_id
+        }
+
+        /// Marks a node as deleted (soft delete).
+        /// Traversals will skip this node.
+        pub fn remove_node(&mut self, id: &str) {
+            if let Some(u_id) = self.node_interner.lookup_id(id) {
+                let idx = u_id as usize;
+                if idx < self.tombstones.len() {
+                    self.tombstones.set(idx, true);
+                }
+            }
+        }
+
+        pub fn is_node_deleted(&self, id: u32) -> bool {
+            self.tombstones.get(id as usize).as_deref() == Some(&true)
+        }
+
+        /// Returns the total number of edges in the graph.
+        pub fn edge_count(&self) -> usize {
+            self.outgoing.iter().map(|edges| edges.len()).sum()
+        }
+
+        /// Resolves or creates a u8 ID for an edge type string.
+        /// Panics if more than 255 edge types are used (V1 constraint).
+        pub fn get_or_create_type(&mut self, type_name: &str) -> u8 {
+            if let Some(&id) = self.edge_type_map.get(type_name) {
+                return id;
+            }
+            let id = self.edge_type_vec.len();
+            if id > 255 {
+                panic!("QuackGraph V1 Limit: Max 256 unique edge types supported.");
+            }
+            let id_u8 = id as u8;
+            self.edge_type_vec.push(type_name.to_string());
+            self.edge_type_map.insert(type_name.to_string(), id_u8);
+            id_u8
+        }
+
+        pub fn get_type_id(&self, type_name: &str) -> Option<u8> {
+            self.edge_type_map.get(type_name).copied()
+        }
+
+        /// Adds an edge to the graph. 
+        /// Idempotent: Does not add duplicate edges if they already exist.
+        pub fn add_edge(&mut self, source: &str, target: &str, edge_type: &str) {
+            let u_src = self.get_or_create_node(source);
+            let u_tgt = self.get_or_create_node(target);
+            let u_type = self.get_or_create_type(edge_type);
+
+            // Add to forward index (Idempotent)
+            let out_vec = &mut self.outgoing[u_src as usize];
+            if !out_vec.contains(&(u_tgt, u_type)) {
+                out_vec.push((u_tgt, u_type));
+            }
+            
+            // Add to reverse index (Idempotent)
+            let in_vec = &mut self.incoming[u_tgt as usize];
+            if !in_vec.contains(&(u_src, u_type)) {
+                in_vec.push((u_src, u_type));
+            }
+
+            // Ensure nodes are not tombstoned if they are being re-added/linked
+            if self.tombstones.get(u_src as usize).as_deref() == Some(&true) {
+                self.tombstones.set(u_src as usize, false);
+            }
+            if self.tombstones.get(u_tgt as usize).as_deref() == Some(&true) {
+                self.tombstones.set(u_tgt as usize, false);
+            }
+        }
+
+        /// Removes a specific edge from the graph.
+        /// Uses swap_remove for O(1) removal, order is not preserved.
+        pub fn remove_edge(&mut self, source: &str, target: &str, edge_type: &str) {
+            // We only proceed if all entities exist in our interner/maps
+            if let (Some(u_src), Some(u_tgt), Some(u_type)) = (
+                self.node_interner.lookup_id(source),
+                self.node_interner.lookup_id(target),
+                self.edge_type_map.get(edge_type).copied(),
+            ) {
+                // Remove from outgoing
+                if let Some(edges) = self.outgoing.get_mut(u_src as usize) {
+                    if let Some(pos) = edges.iter().position(|x| *x == (u_tgt, u_type)) {
+                        edges.swap_remove(pos);
+                    }
+                }
+                // Remove from incoming
+                if let Some(edges) = self.incoming.get_mut(u_tgt as usize) {
+                    if let Some(pos) = edges.iter().position(|x| *x == (u_src, u_type)) {
+                        edges.swap_remove(pos);
+                    }
+                }
+            }
+        }
+
+        /// Ingests an Apache Arrow RecordBatch directly.
+        /// Expected Schema: Columns named "source", "target", "type" (case-insensitive or exact).
+        pub fn add_arrow_batch(&mut self, batch: &RecordBatch) -> Result<(), String> {
+            let schema = batch.schema();
+            
+            // Resolve column indices by name for robustness (Case-Insensitive)
+            let find_col = |name: &str| -> Result<usize, String> {
+                schema.fields().iter().position(|f| f.name().eq_ignore_ascii_case(name))
+                    .ok_or_else(|| format!("Column '{}' not found in Arrow Batch. Available: {:?}", name, schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()))
+            };
+            
+            let num_rows = batch.num_rows();
+            if num_rows == 0 {
+                return Ok(());
+            }
+
+            // Helper to ensure we have a String/LargeString array, casting Dictionary if needed
+            let prepare_col = |col: &std::sync::Arc<dyn Array>, name: &str| -> Result<std::sync::Arc<dyn Array>, String> {
+                match col.data_type() {
+                    DataType::Utf8 | DataType::LargeUtf8 => Ok(col.clone()),
+                    DataType::Dictionary(_key_type, value_type) => {
+                        // Check if the dictionary value type is a string type we can handle
+                        match value_type.as_ref() {
+                            DataType::Utf8 | DataType::LargeUtf8 => {
+                                // Cast the dictionary to its underlying value type
+                                cast(col.as_ref(), value_type.as_ref())
+                                    .map_err(|e| format!("Cast error for {} column: {}", name, e))
+                            },
+                            other => {
+                                Err(format!("{} column: Dictionary value type {:?} not supported (expected Utf8/LargeUtf8)", name, other))
+                            }
+                        }
+                    },
+                    dt => Err(format!("{} column: Unsupported type {:?}", name, dt)),
+                }
+            };
+
+            let src_col = prepare_col(batch.column(find_col("source")?), "Source")?;
+            let tgt_col = prepare_col(batch.column(find_col("target")?), "Target")?;
+            let type_col = prepare_col(batch.column(find_col("type")?), "Type")?;
+
+            // Wrapper to handle different string array types (Utf8 vs LargeUtf8)
+            enum StringArrayWrapper<'a> {
+                Small(&'a StringArray),
+                Large(&'a LargeStringArray),
+            }
+
+            impl<'a> StringArrayWrapper<'a> {
+                fn value(&self, i: usize) -> &'a str {
+                    match self {
+                        Self::Small(arr) => arr.value(i),
+                        Self::Large(arr) => arr.value(i),
+                    }
+                }
+            }
+
+            macro_rules! get_wrapper {
+                ($col:expr) => {
+                    match $col.data_type() {
+                        DataType::Utf8 => StringArrayWrapper::Small($col.as_string::<i32>()),
+                        DataType::LargeUtf8 => StringArrayWrapper::Large($col.as_string::<i64>()),
+                        _ => unreachable!("Already validated/casted to Utf8/LargeUtf8"),
+                    }
+                }
+            }
+
+            let src_wrapper = get_wrapper!(src_col);
+            let tgt_wrapper = get_wrapper!(tgt_col);
+            let type_wrapper = get_wrapper!(type_col);
+
+            for i in 0..num_rows {
+                self.add_edge(src_wrapper.value(i), tgt_wrapper.value(i), type_wrapper.value(i));
+            }
+            Ok(())
+        }
+
+        /// Low-level neighbor access for Matcher.
+        /// Returns all neighbors connected by `type_id` in `dir`.
+        /// Filters out tombstoned neighbors.
+        pub fn get_neighbors(&self, node_id: u32, type_id: u8, dir: Direction) -> Vec<u32> {
+            let adjacency = match dir {
+                Direction::Outgoing => &self.outgoing,
+                Direction::Incoming => &self.incoming,
+            };
+
+            if let Some(edges) = adjacency.get(node_id as usize) {
+                edges.iter()
+                    .filter_map(|&(target, t)| {
+                        if t == type_id && !self.is_node_deleted(target) {
+                            Some(target)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+
+        /// Generic traversal step (Bidirectional).
+        /// Given a list of source node IDs (strings), find all neighbors connected by `edge_type`
+        /// in the specified `direction`.
+        pub fn traverse(&self, sources: &[String], edge_type: Option<&str>, direction: Direction) -> Vec<String> {
+            let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
+            
+            let mut result_ids: Vec<u32> = Vec::with_capacity(sources.len() * 2);
+            
+            let adjacency = match direction {
+                Direction::Outgoing => &self.outgoing,
+                Direction::Incoming => &self.incoming,
+            };
+
+            for src_str in sources {
+                // If source node doesn't exist in our index, skip it
+                if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                    // Check if node is deleted
+                    if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                        continue;
+                    }
+
+                    if let Some(edges) = adjacency.get(src_id as usize) {
+                        for &(target, type_id) in edges {
+                            // Apply edge type filter if present
+                            if let Some(req_type) = type_filter {
+                                if req_type != type_id {
+                                    continue;
+                                }
+                            }
+                            // Check if target is deleted
+                            if self.tombstones.get(target as usize).as_deref() == Some(&true) {
+                                continue;
+                            }
+                            result_ids.push(target);
+                        }
+                    }
+                }
+            }
+
+            // Deduplicate results
+            result_ids.sort_unstable();
+            result_ids.dedup();
+
+            // Convert back to strings
+            result_ids
+                .into_iter()
+                .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
+                .collect()
+        }
+
+        /// Recursive traversal (BFS) with depth bounds.
+        /// Returns unique node IDs reachable within [min_depth, max_depth].
+        pub fn traverse_recursive(
+            &self,
+            sources: &[String],
+            edge_type: Option<&str>,
+            direction: Direction,
+            min_depth: usize,
+            max_depth: usize,
+        ) -> Vec<String> {
+            let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
+            
+            // Track visited nodes to prevent cycles (O(1) access)
+            // We assume the interner length is the upper bound of IDs
+            let mut visited = bitvec![u8, Lsb0; 0; self.node_interner.len()];
+            let mut result_ids: Vec<u32> = Vec::new();
+            
+            // Queue stores (node_id, current_depth)
+            let mut queue: VecDeque<(u32, usize)> = VecDeque::new();
+
+            let adjacency = match direction {
+                Direction::Outgoing => &self.outgoing,
+                Direction::Incoming => &self.incoming,
+            };
+
+            // Initialize Queue
+            for src_str in sources {
+                if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                    // Skip soft-deleted nodes
+                    if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                        continue;
+                    }
+                    
+                    // Mark source as visited so we don't loop back to it
+                    if (src_id as usize) < visited.len() {
+                        visited.set(src_id as usize, true);
+                    }
+                    
+                    // If min_depth is 0, include sources in result
+                    if min_depth == 0 {
+                        result_ids.push(src_id);
+                    }
+                    
+                    // Start search
+                    queue.push_back((src_id, 0));
+                }
+            }
+
+            while let Some((curr_id, curr_depth)) = queue.pop_front() {
+                if curr_depth >= max_depth {
+                    continue;
+                }
+                
+                let next_depth = curr_depth + 1;
+
+                if let Some(edges) = adjacency.get(curr_id as usize) {
+                    for &(target, type_id) in edges {
+                        // Apply edge type filter
+                        if let Some(req_type) = type_filter {
+                            if req_type != type_id {
+                                continue;
+                            }
+                        }
+                        
+                        // Check soft delete
+                        if self.tombstones.get(target as usize).as_deref() == Some(&true) {
+                            continue;
+                        }
+                        
+                        // Check visited and bounds
+                        if (target as usize) < visited.len() && !visited[target as usize] {
+                            visited.set(target as usize, true);
+                            
+                            if next_depth >= min_depth {
+                                result_ids.push(target);
+                            }
+                            
+                            // Continue BFS only if we haven't hit max depth
+                            if next_depth < max_depth {
+                                queue.push_back((target, next_depth));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Sort for deterministic output
+            result_ids.sort_unstable();
+
+            result_ids
+                .into_iter()
+                .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
+                .collect()
+        }
+
+        pub fn node_count(&self) -> usize {
+            self.node_interner.len()
+        }
+
+        /// Serializes the entire graph topology to a binary file.
+        pub fn save_to_file(&self, path: &str) -> Result<(), String> {
+            let file = File::create(path).map_err(|e| e.to_string())?;
+            let writer = BufWriter::new(file);
+            bincode::serialize_into(writer, self).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// Deserializes the graph topology from a binary file.
+        pub fn load_from_file(path: &str) -> Result<Self, String> {
+            let file = File::open(path).map_err(|e| e.to_string())?;
+            let reader = BufReader::new(file);
+            bincode::deserialize_from(reader).map_err(|e| e.to_string())
+        }
+    }
+  test/integration/concurrency.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph } from '../utils/helpers';
+
+    describe('Integration: Concurrency', () => {
+      let path: string;
+
+      afterEach(async () => {
+        if (path) await cleanupGraph(path);
+      });
+
+      test('should handle concurrent node additions without data loss', async () => {
+        const setup = await createGraph('disk', 'int-concurrency');
+        const g = setup.graph;
+        path = setup.path;
+
+        const count = 100;
+        const promises = [];
+
+        // Fire 100 writes "simultaneously"
+        for (let i = 0; i < count; i++) {
+          promises.push(g.addNode(`node:${i}`, ['Node'], { index: i }));
+        }
+
+        await Promise.all(promises);
+
+        expect(g.native.nodeCount).toBe(count);
+        
+        // Check DB persistence
+        const rows = await g.db.query('SELECT count(*) as c FROM nodes WHERE valid_to IS NULL');
+        const c = Number(rows[0].c); 
+        expect(c).toBe(count);
+      });
+
+      test('should handle concurrent edge additions between same nodes', async () => {
+        // Tests locking mechanism on adjacency list (if any) or vector resizing safety
+        const setup = await createGraph('disk', 'int-concurrency-edges');
+        const g = setup.graph;
+        path = setup.path;
+
+        await g.addNode('A', ['Node']);
+        await g.addNode('B', ['Node']);
+
+        const count = 50;
+        const promises = [];
+
+        // Add 50 edges "simultaneously" of DIFFERENT types to avoid idempotency masking the test
+        for (let i = 0; i < count; i++) {
+          promises.push(g.addEdge('A', 'B', `LINK_${i}`));
+        }
+
+        await Promise.all(promises);
+
+        expect(g.native.edgeCount).toBe(count);
+
+        // Verify traversal finds them all
+        // Checking one specific link
+        const neighbors = g.native.traverse(['A'], 'LINK_42', 'out');
+        expect(neighbors).toEqual(['B']);
+      });
+    });
+  packages/native/src/lib.rs: |-
+    #![deny(clippy::all)]
+
+    use napi::bindgen_prelude::*;
+    use napi_derive::napi;
+    use quack_core::{matcher::{Matcher, PatternEdge}, GraphIndex, Direction};
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    #[napi]
+    pub struct NativeGraph {
+        inner: GraphIndex,
+    }
+
+    #[napi(object)]
+    pub struct JsPatternEdge {
+        pub src_var: u32,
+        pub tgt_var: u32,
+        pub edge_type: String,
+        pub direction: Option<String>,
+    }
+    #[napi]
+    impl NativeGraph {
+        #[napi(constructor)]
+        pub fn new() -> Self {
+            Self {
+                inner: GraphIndex::new(),
+            }
+        }
+
+        #[napi]
+        pub fn add_node(&mut self, id: String) {
+            self.inner.get_or_create_node(&id);
+        }
+
+        /// Hydrates the graph from an Arrow IPC stream (Buffer).
+        /// Zero-copy (mostly) data transfer from DuckDB.
+        #[napi]
+        pub fn load_arrow_ipc(&mut self, buffer: Buffer) -> napi::Result<()> {
+            let cursor = Cursor::new(buffer.as_ref());
+            let reader = StreamReader::try_new(cursor, None).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+            for batch in reader {
+                let batch = batch.map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                self.inner.add_arrow_batch(&batch).map_err(napi::Error::from_reason)?;
+            }
+            Ok(())
+        }
+
+        /// Compacts the graph's memory usage.
+        /// Call this after hydration to reclaim unused capacity in the adjacency lists.
+        #[napi]
+        pub fn compact(&mut self) {
+            self.inner.compact();
+        }
+
+        #[napi]
+        pub fn add_edge(&mut self, source: String, target: String, edge_type: String) {
+            self.inner.add_edge(&source, &target, &edge_type);
+        }
+
+        #[napi]
+        pub fn remove_node(&mut self, id: String) {
+            self.inner.remove_node(&id);
+        }
+
+        #[napi]
+        pub fn remove_edge(&mut self, source: String, target: String, edge_type: String) {
+            self.inner.remove_edge(&source, &target, &edge_type);
+        }
+
+        /// Performs a single-hop traversal (bfs-step).
+        /// Returns unique neighbor IDs.
+        #[napi]
+        pub fn traverse(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>) -> Vec<String> {
+            let dir = match direction.as_deref() {
+                Some("in") | Some("IN") => Direction::Incoming,
+                _ => Direction::Outgoing,
+            };
+            self.inner.traverse(&sources, edge_type.as_deref(), dir)
+        }
+
+        /// Performs a recursive traversal (BFS) with depth bounds.
+        /// Returns unique node IDs reachable within [min_depth, max_depth].
+        #[napi(js_name = "traverseRecursive")]
+        pub fn traverse_recursive(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>, min_depth: Option<u32>, max_depth: Option<u32>) -> Vec<String> {
+            let dir = match direction.as_deref() {
+                Some("in") | Some("IN") => Direction::Incoming,
+                _ => Direction::Outgoing,
+            };
+            
+            let min = min_depth.unwrap_or(1) as usize;
+            let max = max_depth.unwrap_or(1) as usize;
+            
+            self.inner.traverse_recursive(&sources, edge_type.as_deref(), dir, min, max)
+        }
+
+        /// Finds subgraphs matching the given pattern.
+        /// `start_ids` maps to variable 0 in the pattern.
+        #[napi(js_name = "matchPattern")]
+        pub fn match_pattern(&self, start_ids: Vec<String>, pattern: Vec<JsPatternEdge>) -> Vec<Vec<String>> {
+            let mut core_pattern = Vec::with_capacity(pattern.len());
+            for p in pattern {
+                if let Some(type_id) = self.inner.get_type_id(&p.edge_type) {
+                    core_pattern.push(PatternEdge {
+                        src_var: p.src_var as usize,
+                        tgt_var: p.tgt_var as usize,
+                        type_id,
+                        direction: match p.direction.as_deref() {
+                            Some("in") | Some("IN") => Direction::Incoming,
+                            _ => Direction::Outgoing,
+                        },
+                    });
+                } else {
+                    return Vec::new(); // Edge type doesn't exist, no matches possible.
+                }
+            }
+
+            let start_candidates: Vec<u32> = start_ids.iter()
+                .filter_map(|id| self.inner.lookup_id(id))
+                .collect();
+
+            if start_candidates.is_empty() {
+                return Vec::new();
+            }
+
+            let matcher = Matcher::new(&self.inner, &core_pattern);
+            let raw_results = matcher.find_matches(&start_candidates);
+
+            raw_results.into_iter().map(|row| {
+                row.into_iter().filter_map(|uid| self.inner.lookup_str(uid).map(|s| s.to_string())).collect()
+            }).collect()
+        }
+
+        /// Returns the number of nodes in the interned index.
+        /// Useful for debugging hydration.
+        #[napi(getter)]
+        pub fn node_count(&self) -> u32 {
+            // We cast to u32 because exposing usize to JS can be finicky depending on napi version,
+            // though napi usually handles numbers well. Safe for V1.
+            self.inner.node_count() as u32
+        }
+
+        #[napi(getter)]
+        pub fn edge_count(&self) -> u32 {
+            self.inner.edge_count() as u32
+        }
+
+        #[napi]
+        pub fn save_snapshot(&self, path: String) -> napi::Result<()> {
+            self.inner.save_to_file(&path).map_err(napi::Error::from_reason)
+        }
+
+        #[napi]
+        pub fn load_snapshot(&mut self, path: String) -> napi::Result<()> {
+            let loaded = GraphIndex::load_from_file(&path).map_err(napi::Error::from_reason)?;
+            self.inner = loaded;
+            Ok(())
+        }
+    }
+
+    impl Default for NativeGraph {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+approved: true
+linesAdded: 101
+linesRemoved: 3
+linesDifference: 104
+gitCommittedAt: null
+status: committed
+id: 55

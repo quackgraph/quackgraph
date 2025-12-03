@@ -1,0 +1,198 @@
+uuid: 9b23c4d5-6789-0123-4567-890123456789
+projectId: quackgraph
+createdAt: '2025-12-02T05:39:23.265Z'
+gitCommitMsg: >-
+  feat(orm): implement duckdb storage and schema layer
+
+  Introduces the `quack-graph` package. - Adds `DuckDBManager` for async
+  database interactions. - Adds `SchemaManager` to initialize the `nodes` and
+  `edges` tables and handle append-only writes. - Configures the monorepo
+  workspaces.
+promptSummary: >-
+  Executed Part 3 (TypeScript ORM Layer). Updated root workspace config. Created
+  `packages/quack-graph` with `DuckDBManager` for connection handling and
+  `SchemaManager` for table creation and data insertion (Nodes/Edges).
+reasoning:
+  - >-
+    Step 3 focuses on the **TypeScript ORM Layer**, specifically the Storage and
+    Schema management.
+  - 'I will:'
+  - 1.  Update the root `package.json` to define the workspace configuration.
+  - 2.  Initialize the `packages/quack-graph` package.
+  - 3.  Implement `DuckDBManager` to handle the database connection.
+  - >-
+    4.  Implement the `SchemaManager` to handle table creation (`nodes`,
+    `edges`) and data insertion.
+  - '### 1. Update Root `package.json`'
+  - >-
+    We need to register the `packages/*` workspace so Bun/NPM knows how to link
+    them.
+  - '### 2. Scaffold QuackGraph Package'
+  - This is the main library that users will install.
+  - '### 3. Database Manager (`src/db.ts`)'
+  - >-
+    A lightweight wrapper around `duckdb-async` to manage the connection
+    lifecycle.
+  - '### 4. Schema & Storage Manager (`src/schema.ts`)'
+  - >-
+    This file handles the SQL definitions based on the RFC (Schema V1) and
+    provides helper methods to write data to DuckDB.
+  - '### 5. Package Entry Point (`src/index.ts`)'
+  - Exporting the storage layer components.
+operations:
+  - type: write
+    path: package.json
+    content: |
+      --- package.json
+      +++ package.json
+      @@ -6,2 +6,5 @@
+         "private": true,
+      +  "workspaces": [
+      +    "packages/*"
+      +  ],
+         "devDependencies": {
+           "@types/bun": "latest"
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/package.json
+    content: |-
+      {
+        "name": "quack-graph",
+        "version": "0.1.0",
+        "main": "src/index.ts",
+        "type": "module",
+        "dependencies": {
+          "duckdb-async": "^1.0.0",
+          "apache-arrow": "^17.0.0",
+          "@quackgraph/native": "workspace:*"
+        },
+        "devDependencies": {
+          "typescript": "^5.0.0",
+          "@types/node": "^20.0.0"
+        }
+      }
+    patchStrategy: replace
+  - type: write
+    path: packages/quack-graph/src/db.ts
+    content: |-
+      import { Database } from 'duckdb-async';
+
+      export class DuckDBManager {
+        private db: Database | null = null;
+        private path: string;
+
+        constructor(path: string = ':memory:') {
+          this.path = path;
+        }
+
+        async init() {
+          if (!this.db) {
+            this.db = await Database.create(this.path);
+          }
+        }
+
+        getDb(): Database {
+          if (!this.db) {
+            throw new Error('Database not initialized. Call init() first.');
+          }
+          return this.db;
+        }
+
+        async execute(sql: string, params: any[] = []): Promise<void> {
+          const db = this.getDb();
+          await db.run(sql, params);
+        }
+
+        async query(sql: string, params: any[] = []): Promise<any[]> {
+          const db = this.getDb();
+          return await db.all(sql, params);
+        }
+      }
+    patchStrategy: replace
+  - type: write
+    path: packages/quack-graph/src/schema.ts
+    content: |-
+      import { DuckDBManager } from './db';
+
+      const NODES_TABLE = `
+      CREATE TABLE IF NOT EXISTS nodes (
+          row_id UBIGINT PRIMARY KEY, -- Simple auto-increment equivalent logic handled by sequence
+          id TEXT NOT NULL,
+          labels TEXT[],
+          properties JSON,
+          valid_from TIMESTAMP DEFAULT current_timestamp,
+          valid_to TIMESTAMP DEFAULT NULL
+      );
+      CREATE SEQUENCE IF NOT EXISTS seq_node_id;
+      `;
+
+      const EDGES_TABLE = `
+      CREATE TABLE IF NOT EXISTS edges (
+          source TEXT NOT NULL,
+          target TEXT NOT NULL,
+          type TEXT NOT NULL,
+          properties JSON,
+          valid_from TIMESTAMP DEFAULT current_timestamp,
+          valid_to TIMESTAMP DEFAULT NULL
+      );
+      `;
+
+      export class SchemaManager {
+        constructor(private db: DuckDBManager) {}
+
+        async ensureSchema() {
+          await this.db.execute(NODES_TABLE);
+          await this.db.execute(EDGES_TABLE);
+        }
+
+        async writeNode(id: string, labels: string[], properties: Record<string, any> = {}) {
+          // Append-only: We insert a new version. 
+          // In a full implementation, we might soft-delete the previous version by setting valid_to.
+          // For V1 Alpha, we just insert.
+          const sql = `
+            INSERT INTO nodes (row_id, id, labels, properties) 
+            VALUES (nextval('seq_node_id'), ?, ?, ?::JSON)
+          `;
+          await this.db.execute(sql, [id, labels, JSON.stringify(properties)]);
+        }
+
+        async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}) {
+          const sql = `
+            INSERT INTO edges (source, target, type, properties) 
+            VALUES (?, ?, ?, ?::JSON)
+          `;
+          await this.db.execute(sql, [source, target, type, JSON.stringify(properties)]);
+        }
+      }
+    patchStrategy: replace
+  - type: write
+    path: packages/quack-graph/src/index.ts
+    content: |-
+      export * from './db';
+      export * from './schema';
+    patchStrategy: replace
+snapshot:
+  packages/quack-graph/package.json: null
+  packages/quack-graph/src/db.ts: null
+  packages/quack-graph/src/schema.ts: null
+  packages/quack-graph/src/index.ts: null
+  package.json: |
+    {
+      "name": "quackgraph",
+      "module": "index.ts",
+      "type": "module",
+      "private": true,
+      "devDependencies": {
+        "@types/bun": "latest"
+      },
+      "peerDependencies": {
+        "typescript": "^5"
+      }
+    }
+approved: true
+linesAdded: 105
+linesRemoved: 0
+linesDifference: 105
+gitCommittedAt: '2025-12-02T08:17:06.623Z'
+status: committed
+id: 3

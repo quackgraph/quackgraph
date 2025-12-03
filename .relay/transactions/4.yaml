@@ -1,0 +1,243 @@
+uuid: 1d9e76a0-56f8-4e12-9c3a-8b29c5a7d6e4
+projectId: quackgraph
+createdAt: '2025-12-02T05:42:27.455Z'
+gitCommitMsg: >-
+  feat(engine): implement hydration and query execution
+
+  - Added `QuackGraph` class: Handles init, hydration from DuckDB to Rust, and
+  write-through operations. - Added `QueryBuilder` class: Implements the Fluent
+  API. - Implemented the "Sandwich" execution model:
+    1. Filter start nodes in DuckDB.
+    2. Traverse graph in Rust (In-Memory).
+    3. Fetch final node properties from DuckDB.
+promptSummary: >-
+  Executed Part 4 (Hydration & Query Engine). Implemented `QuackGraph` class
+  which orchestrates DB and Native Graph. Implemented `QueryBuilder` for the
+  fluent API (`match`, `where`, `out`, `select`) which executes the "Sandwich"
+  query plan (DuckDB -> Rust -> DuckDB).
+reasoning:
+  - >-
+    Part 4 covers the high-level orchestration: hydration, the query builder,
+    and the execution engine. I will implement the `QuackGraph` class (the main
+    entry point) and the `QueryBuilder` class (the Fluent API).
+  - '### 1. The Main Graph Class (`src/graph.ts`)'
+  - This class coordinates the "Split-Brain" architecture.
+  - >-
+    *   **Init:** Connects to DuckDB, ensures tables exist, and performs
+    hydration.
+  - >-
+    *   **Hydration:** Reads edges from DuckDB and populates the Rust
+    `NativeGraph`.
+  - >-
+    *   **Write-Through:** Updates to nodes/edges are written to DuckDB (Disk)
+    and then immediately reflected in `NativeGraph` (RAM) to ensure consistency
+    without re-hydration.
+  - '### 2. The Query Builder (`src/query.ts`)'
+  - This implements the Fluent API and the "Sandwich" execution strategy.
+  - >-
+    1.  **DuckDB (Filter):** Narrow down the starting set of nodes based on
+    properties/labels.
+  - 2.  **Rust (Traverse):** Perform fast hops in memory.
+  - 3.  **DuckDB (Fetch):** Retrieve full properties for the resulting node IDs.
+  - '### 3. Update Exports (`src/index.ts`)'
+  - Expose the new classes.
+operations:
+  - type: write
+    path: packages/quack-graph/src/graph.ts
+    content: |-
+      import { NativeGraph } from '@quackgraph/native';
+      import { DuckDBManager } from './db';
+      import { SchemaManager } from './schema';
+      import { QueryBuilder } from './query';
+
+      export class QuackGraph {
+        db: DuckDBManager;
+        schema: SchemaManager;
+        native: NativeGraph;
+
+        constructor(path: string = ':memory:') {
+          this.db = new DuckDBManager(path);
+          this.schema = new SchemaManager(this.db);
+          this.native = new NativeGraph();
+        }
+
+        async init() {
+          await this.db.init();
+          await this.schema.ensureSchema();
+          await this.hydrate();
+        }
+
+        /**
+         * Hydrates the in-memory Rust graph from the persistent DuckDB storage.
+         * This is critical for the "Split-Brain" architecture.
+         */
+        async hydrate() {
+          // V1 Implementation: Fetch all active edges and loop-feed Rust.
+          // Optimization Target: In V2, replace this with Arrow IPC Zero-Copy streaming.
+          const edges = await this.db.query(
+            "SELECT source, target, type FROM edges WHERE valid_to IS NULL"
+          );
+          
+          // Bulk load into Rust Memory
+          for (const row of edges) {
+            // DuckDB driver returns row objects
+            this.native.addEdge(row.source, row.target, row.type);
+          }
+          
+          // Also hydrate nodes to ensure they exist in the interner even if they have no edges yet?
+          // The current Rust implementation creates nodes lazily on edge addition.
+          // Ideally we should also scan nodes, but for V1 traversals, only connected nodes matter usually.
+        }
+
+        // --- Write Operations (Write-Through) ---
+
+        async addNode(id: string, labels: string[], props: Record<string, any> = {}) {
+          // 1. Write to Disk (Source of Truth)
+          await this.schema.writeNode(id, labels, props);
+          // 2. Write to RAM (Cache)
+          this.native.addNode(id);
+        }
+
+        async addEdge(source: string, target: string, type: string, props: Record<string, any> = {}) {
+          // 1. Write to Disk
+          await this.schema.writeEdge(source, target, type, props);
+          // 2. Write to RAM
+          this.native.addEdge(source, target, type);
+        }
+
+        // --- Read Operations ---
+
+        match(labels: string[]): QueryBuilder {
+          return new QueryBuilder(this, labels);
+        }
+      }
+    patchStrategy: replace
+  - type: write
+    path: packages/quack-graph/src/query.ts
+    content: |-
+      import { QuackGraph } from './graph';
+
+      type TraversalStep = {
+        type: 'out' | 'in';
+        edge: string;
+      };
+
+      export class QueryBuilder {
+        private graph: QuackGraph;
+        private startLabels: string[];
+        private filters: Record<string, any> = {};
+        private traversals: TraversalStep[] = [];
+
+        constructor(graph: QuackGraph, labels: string[]) {
+          this.graph = graph;
+          this.startLabels = labels;
+        }
+
+        /**
+         * Filter starting nodes by properties.
+         * Currently supports exact matches.
+         */
+        where(criteria: Record<string, any>): this {
+          this.filters = { ...this.filters, ...criteria };
+          return this;
+        }
+
+        /**
+         * Traverse outgoing edges of a specific type.
+         */
+        out(edgeType: string): this {
+          this.traversals.push({ type: 'out', edge: edgeType });
+          return this;
+        }
+
+        /**
+         * Execute the query and return the resulting Nodes with their properties.
+         */
+        async select(): Promise<any[]> {
+          // --- Step 1: DuckDB Filter (Bottom Bun) ---
+          // Construct SQL to find starting node IDs
+          let query = `SELECT id FROM nodes WHERE valid_to IS NULL`;
+          const params: any[] = [];
+
+          // Filter by Labels
+          // Using list_contains for DuckDB LIST/ARRAY types
+          if (this.startLabels.length > 0) {
+            // For V1, we check if the first label exists in the list
+            query += ` AND list_contains(labels, ?)`;
+            params.push(this.startLabels[0]);
+          }
+
+          // Filter by Properties (JSON)
+          // SQL Injection warning: key names are interpolated directly. 
+          // In V1 assume trusted input for keys.
+          for (const [key, value] of Object.entries(this.filters)) {
+            query += ` AND json_extract(properties, '$.${key}') = ?`;
+            params.push(value); // Value is bound safely
+          }
+
+          const startRows = await this.graph.db.query(query, params);
+          let currentIds: string[] = startRows.map(row => row.id);
+
+          // If no nodes match filters, abort
+          if (currentIds.length === 0) return [];
+
+          // --- Step 2: Rust Traversal (The Meat) ---
+          for (const step of this.traversals) {
+            if (currentIds.length === 0) break;
+
+            if (step.type === 'out') {
+              // Native traversal: O(1) lookups in RAM
+              currentIds = this.graph.native.traverse(currentIds, step.edge);
+            }
+          }
+
+          // --- Step 3: DuckDB Hydration (Top Bun) ---
+          if (currentIds.length === 0) return [];
+
+          // Fetch full node details for the resulting IDs
+          // "SELECT * FROM nodes WHERE id IN (?, ?, ...)"
+          const placeholders = currentIds.map(() => '?').join(',');
+          const finalSql = `SELECT * FROM nodes WHERE id IN (${placeholders}) AND valid_to IS NULL`;
+          
+          const results = await this.graph.db.query(finalSql, currentIds);
+
+          // Map results to clean objects
+          return results.map(r => {
+            // properties might be a JSON string or object depending on driver
+            let props = r.properties;
+            if (typeof props === 'string') {
+              try { props = JSON.parse(props); } catch {}
+            }
+            return {
+              id: r.id,
+              labels: r.labels, // Should be array
+              ...props
+            };
+          });
+        }
+      }
+    patchStrategy: replace
+  - type: write
+    path: packages/quack-graph/src/index.ts
+    content: |
+      --- packages/quack-graph/src/index.ts
+      +++ packages/quack-graph/src/index.ts
+      @@ -1,2 +1,4 @@
+       export * from './db';
+       export * from './schema';
+      +export * from './graph';
+      +export * from './query';
+    patchStrategy: standard-diff
+snapshot:
+  packages/quack-graph/src/graph.ts: null
+  packages/quack-graph/src/query.ts: null
+  packages/quack-graph/src/index.ts: |-
+    export * from './db';
+    export * from './schema';
+approved: true
+linesAdded: 169
+linesRemoved: 0
+linesDifference: 169
+gitCommittedAt: '2025-12-02T08:17:06.623Z'
+status: committed
+id: 4

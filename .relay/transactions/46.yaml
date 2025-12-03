@@ -1,0 +1,1936 @@
+uuid: 1845112e-1512-4211-9251-125412541254
+projectId: quackgraph
+createdAt: '2025-12-02T14:14:13.656Z'
+gitCommitMsg: >-
+  feat(core): Add subgraph isomorphism solver and analytics builder
+
+  - Implemented `Matcher` in Rust for structural pattern matching
+  (Backtracking). - Exposed `matchPattern` to NativeGraph. - Added `groupBy`,
+  `orderBy`, `limit` to QueryBuilder. - Updated `select()` to support raw SQL
+  projections for in-DB analytics.
+promptSummary: >-
+  I implemented the Rust-based Subgraph Isomorphism Solver (VF2-style
+  backtracking) and exposed it via Napi. I also updated the TypeScript
+  QueryBuilder to support server-side analytics (GROUP BY, ORDER BY) and raw SQL
+  projections.
+reasoning:
+  - >-
+    I will execute the plan to implement the Rust-based Subgraph Isomorphism
+    Solver and the TypeScript-based Analytics Builder.
+  - '### Part 1: Rust Core - Subgraph Isomorphism Solver'
+  - First, I will create the matcher module.
+  - >-
+    Now I need to expose `get_neighbors` and `is_node_deleted` in `GraphIndex`.
+    I'll update `crates/quack_core/src/topology.rs`.
+  - >-
+    Wait, I made a mistake in the diff for `get_type_id`. It duplicated lines.
+    Let me correct the search block or just use replace.
+  - >-
+    Also, I need to export the `matcher` module in
+    `crates/quack_core/src/lib.rs`.
+  - >-
+    Correcting `crates/quack_core/src/topology.rs` with `standard-diff`. Note: I
+    should fix the `get_type_id` logic.
+  - Now updating `packages/native/src/lib.rs` to expose the matcher.
+  - >-
+    I need to add `lookup_id` and `lookup_str` to `GraphIndex` so
+    `native/lib.rs` can use them.
+  - Now I can implement `match_pattern` fully in `native/lib.rs`.
+  - Update definitions `packages/native/index.d.ts`.
+  - '### Part 2: TypeScript Analytics Builder'
+  - I will modify `packages/quack-graph/src/query.ts` to support aggregations.
+  - >-
+    Wait, there is a small bug in my mental diff above. `finalParams` was
+    accumulating parameters, but `this.graph.db.query` takes SQL and the params
+    array. In the original code:
+  - 'My replacement:'
+  - Yes, this is correct. I will apply this with `standard-diff`.
+  - >-
+    I have completed Part 1 (Matcher in Rust) and Part 2 (Analytics Builder in
+    TS).
+  - 'Final sanity check:'
+  - '- `matcher.rs`: Implements backtracking. Handles `start_candidates`.'
+  - >-
+    - `GraphIndex` updates: `is_node_deleted`, `get_type_id`, `get_neighbors`,
+    `lookup_id`, `lookup_str`.
+  - '- `NativeGraph` updates: `match_pattern`, `JsPatternEdge`.'
+  - '- `QueryBuilder`: `groupBy`, `orderBy`, etc., and `select` override.'
+  - 'One logic check on `matcher.rs`:'
+  - In `intersect`, `candidates = self.intersect(candidates, neighbors);`.
+  - If `candidates` becomes empty, `backtrack` returns. Correct.
+  - If `candidates` is None (first constraint), it becomes `neighbors`. Correct.
+  - >-
+    Isomorphism check `!used_nodes.contains(&cand)` ensures distinct nodes.
+    Correct.
+  - Looks good.
+  - '### Final Step: YAML'
+operations:
+  - type: write
+    path: crates/quack_core/src/matcher.rs
+    content: >-
+      use crate::topology::{GraphIndex, Direction};
+
+      use std::collections::HashSet;
+
+
+      #[derive(Debug, Clone)]
+
+      pub struct PatternEdge {
+          pub src_var: usize,
+          pub tgt_var: usize,
+          pub type_id: u8,
+          pub direction: Direction, // Direction relative to the canonical edge in GraphIndex (Outgoing/Incoming)
+      }
+
+
+      /// A simple backtracking solver for subgraph isomorphism.
+
+      /// Finds all assignments of graph nodes to pattern variables such that
+      all pattern edges exist.
+
+      ///
+
+      /// Assumptions:
+
+      /// 1. Variable 0 is the "start" variable, seeded by `start_candidates`.
+
+      /// 2. Variables must be ordered such that for any variable `i > 0`, there
+      is at least one constraint
+
+      ///    connecting it to a variable `j < i`. (Connectedness assumption).
+
+      pub struct Matcher<'a> {
+          graph: &'a GraphIndex,
+          pattern: &'a [PatternEdge],
+          num_vars: usize,
+      }
+
+
+      impl<'a> Matcher<'a> {
+          pub fn new(graph: &'a GraphIndex, pattern: &'a [PatternEdge]) -> Self {
+              let mut max_var = 0;
+              for e in pattern {
+                  max_var = max_var.max(e.src_var).max(e.tgt_var);
+              }
+              Self {
+                  graph,
+                  pattern,
+                  num_vars: max_var + 1,
+              }
+          }
+
+          pub fn find_matches(&self, start_candidates: &[u32]) -> Vec<Vec<u32>> {
+              let mut results = Vec::new();
+              let mut assignment = vec![None; self.num_vars];
+              let mut used_nodes = HashSet::new();
+
+              for &start_node in start_candidates {
+                  // Check if start_node is valid (not deleted)
+                  if self.graph.is_node_deleted(start_node) {
+                      continue;
+                  }
+
+                  assignment[0] = Some(start_node);
+                  used_nodes.insert(start_node);
+                  
+                  self.backtrack(1, &mut assignment, &mut used_nodes, &mut results);
+                  
+                  used_nodes.remove(&start_node);
+                  assignment[0] = None;
+              }
+
+              results
+          }
+
+          fn backtrack(
+              &self,
+              current_var: usize,
+              assignment: &mut Vec<Option<u32>>,
+              used_nodes: &mut HashSet<u32>,
+              results: &mut Vec<Vec<u32>>,
+          ) {
+              if current_var == self.num_vars {
+                  // All variables assigned successfully
+                  results.push(assignment.iter().map(|opt| opt.unwrap()).collect());
+                  return;
+              }
+
+              // 1. Identify constraints for `current_var` against already assigned variables (0..current_var-1)
+              // We look for pattern edges where one end is `current_var` and the other is `assigned_var < current_var`.
+              
+              // We need to find the intersection of candidates.
+              // Start with None (meaning "all nodes" effectively, but we need at least one constraint to limit search).
+              let mut candidates: Option<Vec<u32>> = None;
+
+              for edge in self.pattern {
+                  // Case A: Edge is `known -> current`
+                  if edge.src_var < current_var && edge.tgt_var == current_var {
+                      let known_node = assignment[edge.src_var].unwrap();
+                      let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Outgoing);
+                      candidates = self.intersect(candidates, neighbors);
+                      if candidates.as_ref().map(|c| c.is_empty()).unwrap_or(false) { return; }
+                  }
+                  // Case B: Edge is `current -> known`
+                  else if edge.src_var == current_var && edge.tgt_var < current_var {
+                      let known_node = assignment[edge.tgt_var].unwrap();
+                      // To be a source for known_node, we look at Incoming edges of known_node
+                      let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Incoming);
+                      candidates = self.intersect(candidates, neighbors);
+                      if candidates.as_ref().map(|c| c.is_empty()).unwrap_or(false) { return; }
+                  }
+              }
+
+              // Also check "internal" constraints: Edges between `current_var` and other `current_var` (loops)? 
+              // We assume simple graph for now, no self-loops in pattern unless specified.
+              
+              if let Some(cands) = candidates {
+                  for cand in cands {
+                      // Check isomorphism (uniqueness)
+                      if !used_nodes.contains(&cand) {
+                          
+                          // Verify constraints for edges where BOTH ends are known (e.g. closing a triangle).
+                          // If we just closed a loop to `var < current_var`, we already used it to generate candidates,
+                          // so it's implicitly satisfied.
+                          // BUT, if there are MULTIPLE edges between current and knowns, `intersect` handles it.
+                          
+                          // Proceed
+                          assignment[current_var] = Some(cand);
+                          used_nodes.insert(cand);
+                          
+                          self.backtrack(current_var + 1, assignment, used_nodes, results);
+                          
+                          used_nodes.remove(&cand);
+                          assignment[current_var] = None;
+                      }
+                  }
+              } else {
+                  // No constraints connecting to previous vars. Disconnected pattern part.
+                  // Requires scanning all nodes? For V1, we skip/fail.
+                  // In future, could fallback to scanning all nodes if `current_var` is a new component start.
+              }
+          }
+
+          fn intersect(&self, current: Option<Vec<u32>>, next: Vec<u32>) -> Option<Vec<u32>> {
+              match current {
+                  None => Some(next), // First constraint defines the set
+                  Some(curr) => {
+                      // Intersect sorted vectors (GraphIndex neighbors are not guaranteed sorted by ID unless we enforce it, 
+                      // but `traverse` returns unique... `get_neighbors` returns raw. 
+                      // Let's assume naive intersection for V1 or use HashSet if needed.
+                      // Vectors are likely small-ish.
+                      let set: HashSet<_> = next.into_iter().collect();
+                      Some(curr.into_iter().filter(|id| set.contains(id)).collect())
+                  }
+              }
+          }
+      }
+    patchStrategy: replace
+  - type: write
+    path: crates/quack_core/src/topology.rs
+    content: >
+      --- crates/quack_core/src/topology.rs
+
+      +++ crates/quack_core/src/topology.rs
+
+      @@ -19,6 +19,7 @@
+           tombstones: BitVec,
+       }
+       
+      +#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+       pub enum Direction {
+           Outgoing,
+           Incoming,
+      @@ -79,6 +80,10 @@
+               }
+           }
+       
+      +    pub fn is_node_deleted(&self, id: u32) -> bool {
+
+      +        self.tombstones.get(id as usize).as_deref() == Some(&true)
+
+      +    }
+
+      +
+           /// Returns the total number of edges in the graph.
+           pub fn edge_count(&self) -> usize {
+               self.outgoing.iter().map(|edges| edges.len()).sum()
+      @@ -110,6 +115,10 @@
+               }
+               let id_u8 = id as u8;
+               self.edge_type_vec.push(type_name.to_string());
+      +        self.edge_type_map.insert(type_name.to_string(), id_u8);
+
+      +        id_u8
+
+      +    }
+
+      +
+
+      +    pub fn get_type_id(&self, type_name: &str) -> Option<u8> {
+               self.edge_type_map.insert(type_name.to_string(), id_u8);
+               id_u8
+           }
+      @@ -232,6 +241,31 @@
+               Ok(())
+           }
+       
+      +    /// Low-level neighbor access for Matcher.
+
+      +    /// Returns all neighbors connected by `type_id` in `dir`.
+
+      +    /// Filters out tombstoned neighbors.
+
+      +    pub fn get_neighbors(&self, node_id: u32, type_id: u8, dir:
+      Direction) -> Vec<u32> {
+
+      +        let adjacency = match dir {
+
+      +            Direction::Outgoing => &self.outgoing,
+
+      +            Direction::Incoming => &self.incoming,
+
+      +        };
+
+      +
+
+      +        if let Some(edges) = adjacency.get(node_id as usize) {
+
+      +            edges.iter()
+
+      +                .filter_map(|&(target, t)| {
+
+      +                    if t == type_id {
+
+      +                         if self.is_node_deleted(target) {
+
+      +                             None
+
+      +                         } else {
+
+      +                             Some(target)
+
+      +                         }
+
+      +                    } else {
+
+      +                        None
+
+      +                    }
+
+      +                })
+
+      +                .collect()
+
+      +        } else {
+
+      +            Vec::new()
+
+      +        }
+
+      +    }
+
+      +
+           /// Generic traversal step (Bidirectional).
+           /// Given a list of source node IDs (strings), find all neighbors connected by `edge_type`
+           /// in the specified `direction`.
+    patchStrategy: standard-diff
+  - type: write
+    path: crates/quack_core/src/lib.rs
+    content: |-
+      pub mod interner;
+      pub mod topology;
+      pub mod matcher;
+
+      pub use interner::Interner;
+      pub use topology::{GraphIndex, Direction};
+    patchStrategy: replace
+  - type: write
+    path: crates/quack_core/src/topology.rs
+    content: >
+      --- crates/quack_core/src/topology.rs
+
+      +++ crates/quack_core/src/topology.rs
+
+      @@ -19,6 +19,7 @@
+           tombstones: BitVec,
+       }
+       
+      +#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+       pub enum Direction {
+           Outgoing,
+           Incoming,
+      @@ -79,6 +80,10 @@
+               }
+           }
+       
+      +    pub fn is_node_deleted(&self, id: u32) -> bool {
+
+      +        self.tombstones.get(id as usize).as_deref() == Some(&true)
+
+      +    }
+
+      +
+           /// Returns the total number of edges in the graph.
+           pub fn edge_count(&self) -> usize {
+               self.outgoing.iter().map(|edges| edges.len()).sum()
+      @@ -98,8 +103,11 @@
+               let id_u8 = id as u8;
+               self.edge_type_vec.push(type_name.to_string());
+               self.edge_type_map.insert(type_name.to_string(), id_u8);
+               id_u8
+           }
+       
+      +    pub fn get_type_id(&self, type_name: &str) -> Option<u8> {
+
+      +        self.edge_type_map.get(type_name).copied()
+
+      +    }
+
+      +
+           /// Adds an edge to the graph. 
+           /// Idempotent: Does not add duplicate edges if they already exist.
+      @@ -232,6 +240,31 @@
+               Ok(())
+           }
+       
+      +    /// Low-level neighbor access for Matcher.
+
+      +    /// Returns all neighbors connected by `type_id` in `dir`.
+
+      +    /// Filters out tombstoned neighbors.
+
+      +    pub fn get_neighbors(&self, node_id: u32, type_id: u8, dir:
+      Direction) -> Vec<u32> {
+
+      +        let adjacency = match dir {
+
+      +            Direction::Outgoing => &self.outgoing,
+
+      +            Direction::Incoming => &self.incoming,
+
+      +        };
+
+      +
+
+      +        if let Some(edges) = adjacency.get(node_id as usize) {
+
+      +            edges.iter()
+
+      +                .filter_map(|&(target, t)| {
+
+      +                    if t == type_id {
+
+      +                         if self.is_node_deleted(target) {
+
+      +                             None
+
+      +                         } else {
+
+      +                             Some(target)
+
+      +                         }
+
+      +                    } else {
+
+      +                        None
+
+      +                    }
+
+      +                })
+
+      +                .collect()
+
+      +        } else {
+
+      +            Vec::new()
+
+      +        }
+
+      +    }
+
+      +
+           /// Generic traversal step (Bidirectional).
+           /// Given a list of source node IDs (strings), find all neighbors connected by `edge_type`
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/native/src/lib.rs
+    content: >
+      --- packages/native/src/lib.rs
+
+      +++ packages/native/src/lib.rs
+
+      @@ -2,7 +2,8 @@
+       
+       use napi::bindgen_prelude::*;
+       use napi_derive::napi;
+      -use quack_core::{GraphIndex, Direction};
+
+      +use quack_core::{GraphIndex, Direction, interner::Interner};
+
+      +use quack_core::matcher::{Matcher, PatternEdge};
+       use arrow::ipc::reader::StreamReader;
+       use std::io::Cursor;
+       
+      @@ -10,6 +11,13 @@
+       pub struct NativeGraph {
+           inner: GraphIndex,
+       }
+       
+      +#[napi(object)]
+
+      +pub struct JsPatternEdge {
+
+      +    pub src_var: u32,
+
+      +    pub tgt_var: u32,
+
+      +    pub edge_type: String,
+
+      +    pub direction: Option<String>,
+
+      +}
+
+      +
+       #[napi]
+       impl NativeGraph {
+           #[napi(constructor)]
+      @@ -99,6 +107,43 @@
+               self.inner.traverse_recursive(&sources, edge_type.as_deref(), dir, min, max)
+           }
+       
+      +    /// Finds subgraphs matching the given pattern.
+
+      +    /// `start_ids` maps to variable 0 in the pattern.
+
+      +    #[napi]
+
+      +    pub fn match_pattern(&self, start_ids: Vec<String>, pattern:
+      Vec<JsPatternEdge>) -> Vec<Vec<String>> {
+
+      +        // Convert JsPatternEdge to core PatternEdge
+
+      +        let mut core_pattern = Vec::with_capacity(pattern.len());
+
+      +        
+
+      +        for p in pattern {
+
+      +            let type_id = self.inner.get_type_id(&p.edge_type);
+
+      +            if type_id.is_none() {
+
+      +                // If edge type doesn't exist in graph, no match possible
+      for this edge
+
+      +                // We can return early or let the matcher fail
+
+      +                return Vec::new();
+
+      +            }
+
+      +
+
+      +            core_pattern.push(PatternEdge {
+
+      +                src_var: p.src_var as usize,
+
+      +                tgt_var: p.tgt_var as usize,
+
+      +                type_id: type_id.unwrap(),
+
+      +                direction: match p.direction.as_deref() {
+
+      +                    Some("in") | Some("IN") => Direction::Incoming,
+
+      +                    _ => Direction::Outgoing,
+
+      +                },
+
+      +            });
+
+      +        }
+
+      +
+
+      +        // Resolve start IDs
+
+      +        let mut start_candidates = Vec::new();
+
+      +        // We need access to interner. GraphIndex has it privately? 
+
+      +        // We updated GraphIndex to export lookup? No.
+
+      +        // GraphIndex::get_or_create_node is public. But lookup_id was on
+      Interner.
+
+      +        // We should add `lookup_id` to GraphIndex facade or make
+      interner public. 
+
+      +        // Actually `traverse` uses it. Let's look at `traverse`... it
+      uses `self.node_interner`.
+
+      +        // Wait, `node_interner` field is private in `GraphIndex` in
+      `topology.rs`.
+
+      +        // I should add `lookup_node_id` to `GraphIndex` public API.
+
+      +        // For now, I'll rely on the fact that I can't access it unless I
+      edit topology.rs.
+
+      +        
+
+      +        // Let's modify `topology.rs` to add `lookup_id`.
+
+      +        return Vec::new(); // Placeholder until logic below is fixed
+
+      +    }
+
+      +
+           /// Returns the number of nodes in the interned index.
+           /// Useful for debugging hydration.
+           #[napi(getter)]
+    patchStrategy: standard-diff
+  - type: write
+    path: crates/quack_core/src/topology.rs
+    content: |
+      --- crates/quack_core/src/topology.rs
+      +++ crates/quack_core/src/topology.rs
+      @@ -62,6 +62,14 @@
+               self.edge_type_vec.shrink_to_fit();
+           }
+       
+      +    pub fn lookup_id(&self, id: &str) -> Option<u32> {
+      +        self.node_interner.lookup_id(id)
+      +    }
+      +
+      +    pub fn lookup_str(&self, id: u32) -> Option<&str> {
+      +        self.node_interner.lookup(id)
+      +    }
+      +
+           /// Resolves or creates an internal u32 ID for a node string.
+           /// Resizes internal storage if necessary.
+           pub fn get_or_create_node(&mut self, id: &str) -> u32 {
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/native/src/lib.rs
+    content: >
+      --- packages/native/src/lib.rs
+
+      +++ packages/native/src/lib.rs
+
+      @@ -110,6 +110,48 @@
+               self.inner.traverse_recursive(&sources, edge_type.as_deref(), dir, min, max)
+           }
+       
+      +    /// Finds subgraphs matching the given pattern.
+
+      +    /// `start_ids` maps to variable 0 in the pattern.
+
+      +    #[napi]
+
+      +    pub fn match_pattern(&self, start_ids: Vec<String>, pattern:
+      Vec<JsPatternEdge>) -> Vec<Vec<String>> {
+
+      +        let mut core_pattern = Vec::with_capacity(pattern.len());
+
+      +        
+
+      +        for p in pattern {
+
+      +            let type_id = self.inner.get_type_id(&p.edge_type);
+
+      +            if type_id.is_none() {
+
+      +                return Vec::new();
+
+      +            }
+
+      +
+
+      +            core_pattern.push(PatternEdge {
+
+      +                src_var: p.src_var as usize,
+
+      +                tgt_var: p.tgt_var as usize,
+
+      +                type_id: type_id.unwrap(),
+
+      +                direction: match p.direction.as_deref() {
+
+      +                    Some("in") | Some("IN") => Direction::Incoming,
+
+      +                    _ => Direction::Outgoing,
+
+      +                },
+
+      +            });
+
+      +        }
+
+      +
+
+      +        let mut start_candidates = Vec::new();
+
+      +        for id in start_ids {
+
+      +            if let Some(uid) = self.inner.lookup_id(&id) {
+
+      +                start_candidates.push(uid);
+
+      +            }
+
+      +        }
+
+      +
+
+      +        let matcher = Matcher::new(&self.inner, &core_pattern);
+
+      +        let raw_results = matcher.find_matches(&start_candidates);
+
+      +
+
+      +        raw_results.into_iter().map(|row| {
+
+      +            row.into_iter()
+
+      +               .filter_map(|uid| self.inner.lookup_str(uid).map(|s|
+      s.to_string()))
+
+      +               .collect()
+
+      +        }).collect()
+
+      +    }
+
+      +
+           /// Returns the number of nodes in the interned index.
+           /// Useful for debugging hydration.
+           #[napi(getter)]
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/native/index.d.ts
+    content: >
+      --- packages/native/index.d.ts
+
+      +++ packages/native/index.d.ts
+
+      @@ -3,6 +3,13 @@
+       
+       /* auto-generated by NAPI-RS */
+       
+      +export interface JsPatternEdge {
+
+      +  srcVar: number
+
+      +  tgtVar: number
+
+      +  edgeType: string
+
+      +  direction?: string
+
+      +}
+
+      +
+       export declare class NativeGraph {
+         constructor()
+         addNode(id: string): void
+      @@ -29,6 +36,11 @@
+          * Returns unique node IDs reachable within [min_depth, max_depth].
+          */
+         traverseRecursive(sources: Array<string>, edgeType?: string | undefined | null, direction?: string | undefined | null, minDepth?: number | undefined | null, maxDepth?: number | undefined | null): Array<string>
+      +  /**
+
+      +   * Finds subgraphs matching the given pattern.
+
+      +   * `start_ids` maps to variable 0 in the pattern.
+
+      +   */
+
+      +  matchPattern(startIds: Array<string>, pattern: Array<JsPatternEdge>):
+      Array<Array<string>>
+         /**
+          * Returns the number of nodes in the interned index.
+          * Useful for debugging hydration.
+    patchStrategy: standard-diff
+  - type: write
+    path: packages/quack-graph/src/query.ts
+    content: >
+      --- packages/quack-graph/src/query.ts
+
+      +++ packages/quack-graph/src/query.ts
+
+      @@ -23,6 +23,13 @@
+         // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+         private terminalFilters: Record<string, any> = {};
+       
+      +  private aggState = {
+
+      +    groupBy: [] as string[],
+
+      +    orderBy: [] as { field: string; dir: 'ASC' | 'DESC' }[],
+
+      +    limit: undefined as number | undefined,
+
+      +    offset: undefined as number | undefined,
+
+      +  };
+
+      +
+         constructor(graph: QuackGraph, labels: string[]) {
+           this.graph = graph;
+           this.startLabels = labels;
+      @@ -85,6 +92,26 @@
+           return this;
+         }
+       
+      +  groupBy(field: string): this {
+
+      +    this.aggState.groupBy.push(field);
+
+      +    return this;
+
+      +  }
+
+      +
+
+      +  orderBy(field: string, dir: 'ASC' | 'DESC' = 'ASC'): this {
+
+      +    this.aggState.orderBy.push({ field, dir });
+
+      +    return this;
+
+      +  }
+
+      +
+
+      +  limit(n: number): this {
+
+      +    this.aggState.limit = n;
+
+      +    return this;
+
+      +  }
+
+      +
+
+      +  offset(n: number): this {
+
+      +    this.aggState.offset = n;
+
+      +    return this;
+
+      +  }
+
+      +
+         /**
+          * Filter the nodes at the end of the traversal by label.
+          */
+      @@ -109,8 +136,13 @@
+           return `${prefix}valid_to IS NULL`;
+         }
+       
+      +  /**
+
+      +   * Executes the query.
+
+      +   * @param projection Optional SQL projection string (e.g., 'count(*),
+      avg(properties->>age)') or a JS mapper function.
+
+      +   */
+         // biome-ignore lint/suspicious/noExplicitAny: Generic result mapper
+      -  async select<T = any>(mapper?: (node: any) => T): Promise<T[]> {
+
+      +  async select<T = any>(projection?: string | ((node: any) => T)):
+      Promise<T[]> {
+
+      +    const isRawSql = typeof projection === 'string';
+
+      +    const mapper = typeof projection === 'function' ? projection :
+      undefined;
+
+      +
+           // --- Step 1: DuckDB Filter (Bottom Bun) ---
+           // Objective: Get a list of "Active" Node IDs to feed into the graph.
+       
+      @@ -216,7 +248,31 @@
+             }
+           }
+       
+      -    const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join('
+      AND ')}`;
+
+      +    // 3.d Aggregation / Grouping / Ordering
+
+      +    let selectClause = 'SELECT *';
+
+      +    if (isRawSql) {
+
+      +      selectClause = `SELECT ${projection}`;
+
+      +    }
+
+      +
+
+      +    let suffix = '';
+
+      +    if (this.aggState.groupBy.length > 0) {
+
+      +       // If grouping, we likely used a raw projection
+
+      +       suffix += ` GROUP BY ${this.aggState.groupBy.join(', ')}`;
+
+      +    }
+
+      +    
+
+      +    if (this.aggState.orderBy.length > 0) {
+
+      +      const orders = this.aggState.orderBy.map(o => `${o.field}
+      ${o.dir}`).join(', ');
+
+      +      suffix += ` ORDER BY ${orders}`;
+
+      +    }
+
+      +
+
+      +    if (this.aggState.limit !== undefined) {
+
+      +      suffix += ` LIMIT ${this.aggState.limit}`;
+
+      +    }
+
+      +    if (this.aggState.offset !== undefined) {
+
+      +      suffix += ` OFFSET ${this.aggState.offset}`;
+
+      +    }
+
+      +
+
+      +    const finalSql = `${selectClause} FROM nodes WHERE
+      ${finalConditions.join(' AND ')} ${suffix}`;
+           const finalParams = await this.graph.db.query(finalSql, finalParams); // Wait, query returns results, not params. Variable name reuse confusion in original code? 
+           // Ah, original code: const results = await this.graph.db.query(finalSql, finalParams);
+           // Let's fix that.
+      @@ -223,7 +279,7 @@
+             }
+           }
+       
+      -    const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join('
+      AND ')}`;
+
+      -    const results = await this.graph.db.query(finalSql, finalParams);
+
+      +    const results = await this.graph.db.query(finalSql, finalParams);
+       
+           return results.map(r => {
+      +      if (isRawSql) return r; // Return raw rows if projection was SQL
+
+      +      
+             let props = r.properties;
+             if (typeof props === 'string') {
+               try { props = JSON.parse(props); } catch {}
+    patchStrategy: standard-diff
+  - type: write
+    path: >-
+      const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join(' AND
+      ')}`;
+    content: '    const results = await this.graph.db.query(finalSql, finalParams);'
+    patchStrategy: replace
+  - type: write
+    path: >-
+      const finalSql = `${selectClause} FROM nodes WHERE
+      ${finalConditions.join(' AND ')} ${suffix}`;
+    content: '    const results = await this.graph.db.query(finalSql, finalParams);'
+    patchStrategy: replace
+  - type: write
+    path: packages/quack-graph/src/query.ts
+    content: >
+      --- packages/quack-graph/src/query.ts
+
+      +++ packages/quack-graph/src/query.ts
+
+      @@ -23,6 +23,13 @@
+         // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+         private terminalFilters: Record<string, any> = {};
+       
+      +  private aggState = {
+
+      +    groupBy: [] as string[],
+
+      +    orderBy: [] as { field: string; dir: 'ASC' | 'DESC' }[],
+
+      +    limit: undefined as number | undefined,
+
+      +    offset: undefined as number | undefined,
+
+      +  };
+
+      +
+         constructor(graph: QuackGraph, labels: string[]) {
+           this.graph = graph;
+           this.startLabels = labels;
+      @@ -85,6 +92,26 @@
+           return this;
+         }
+       
+      +  groupBy(field: string): this {
+
+      +    this.aggState.groupBy.push(field);
+
+      +    return this;
+
+      +  }
+
+      +
+
+      +  orderBy(field: string, dir: 'ASC' | 'DESC' = 'ASC'): this {
+
+      +    this.aggState.orderBy.push({ field, dir });
+
+      +    return this;
+
+      +  }
+
+      +
+
+      +  limit(n: number): this {
+
+      +    this.aggState.limit = n;
+
+      +    return this;
+
+      +  }
+
+      +
+
+      +  offset(n: number): this {
+
+      +    this.aggState.offset = n;
+
+      +    return this;
+
+      +  }
+
+      +
+         /**
+          * Filter the nodes at the end of the traversal by label.
+          */
+      @@ -109,8 +136,13 @@
+           return `${prefix}valid_to IS NULL`;
+         }
+       
+      +  /**
+
+      +   * Executes the query.
+
+      +   * @param projection Optional SQL projection string (e.g., 'count(*),
+      avg(properties->>age)') or a JS mapper function.
+
+      +   */
+         // biome-ignore lint/suspicious/noExplicitAny: Generic result mapper
+      -  async select<T = any>(mapper?: (node: any) => T): Promise<T[]> {
+
+      +  async select<T = any>(projection?: string | ((node: any) => T)):
+      Promise<T[]> {
+
+      +    const isRawSql = typeof projection === 'string';
+
+      +    const mapper = typeof projection === 'function' ? projection :
+      undefined;
+
+      +
+           // --- Step 1: DuckDB Filter (Bottom Bun) ---
+           // Objective: Get a list of "Active" Node IDs to feed into the graph.
+       
+      @@ -216,11 +248,34 @@
+             }
+           }
+       
+      -    const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join('
+      AND ')}`;
+
+      +    // 3.d Aggregation / Grouping / Ordering
+
+      +    let selectClause = 'SELECT *';
+
+      +    if (isRawSql) {
+
+      +      selectClause = `SELECT ${projection}`;
+
+      +    }
+
+      +
+
+      +    let suffix = '';
+
+      +    if (this.aggState.groupBy.length > 0) {
+
+      +      suffix += ` GROUP BY ${this.aggState.groupBy.join(', ')}`;
+
+      +    }
+
+      +    
+
+      +    if (this.aggState.orderBy.length > 0) {
+
+      +      const orders = this.aggState.orderBy.map(o => `${o.field}
+      ${o.dir}`).join(', ');
+
+      +      suffix += ` ORDER BY ${orders}`;
+
+      +    }
+
+      +
+
+      +    if (this.aggState.limit !== undefined) {
+
+      +      suffix += ` LIMIT ${this.aggState.limit}`;
+
+      +    }
+
+      +    if (this.aggState.offset !== undefined) {
+
+      +      suffix += ` OFFSET ${this.aggState.offset}`;
+
+      +    }
+
+      +
+
+      +    const finalSql = `${selectClause} FROM nodes WHERE
+      ${finalConditions.join(' AND ')} ${suffix}`;
+           const results = await this.graph.db.query(finalSql, finalParams);
+       
+           return results.map(r => {
+      +      if (isRawSql) return r;
+
+      +
+             let props = r.properties;
+             if (typeof props === 'string') {
+               try { props = JSON.parse(props); } catch {}
+    patchStrategy: standard-diff
+snapshot:
+  crates/quack_core/src/matcher.rs: null
+  const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join(' AND ')}`;: null
+  const finalSql = `${selectClause} FROM nodes WHERE ${finalConditions.join(' AND ')} ${suffix}`;: null
+  crates/quack_core/src/lib.rs: |-
+    pub mod interner;
+    pub mod topology;
+
+    pub use interner::Interner;
+    pub use topology::{GraphIndex, Direction};
+  crates/quack_core/src/topology.rs: |-
+    use crate::interner::Interner;
+    use bitvec::prelude::*;
+    use std::collections::{HashMap, VecDeque};
+    use serde::{Serialize, Deserialize};
+    use std::fs::File;
+    use std::io::{BufReader, BufWriter};
+    use arrow::record_batch::RecordBatch;
+    use arrow::array::{AsArray, Array, StringArray, LargeStringArray};
+    use arrow::datatypes::DataType;
+    use arrow::compute::cast;
+
+    /// The core Graph Index.
+    /// Stores topology in RAM using integer IDs.
+    #[derive(Default, Debug, Serialize, Deserialize)]
+    pub struct GraphIndex {
+        node_interner: Interner,
+        
+        // Mapping edge type strings (e.g. "KNOWS") to u8 for compact storage.
+        // Limit: 256 edge types per graph in V1.
+        edge_type_map: HashMap<String, u8>,
+        edge_type_vec: Vec<String>,
+
+        // Forward Graph: Source Node ID -> List of (Target Node ID, Edge Type ID)
+        outgoing: Vec<Vec<(u32, u8)>>,
+        
+        // Reverse Graph: Target Node ID -> List of (Source Node ID, Edge Type ID)
+        incoming: Vec<Vec<(u32, u8)>>,
+
+        // Bitmask for soft-deleted nodes.
+        // true = deleted (tombstone), false = active.
+        tombstones: BitVec,
+    }
+
+    pub enum Direction {
+        Outgoing,
+        Incoming,
+    }
+
+    impl GraphIndex {
+        pub fn new() -> Self {
+            Self {
+                node_interner: Interner::new(),
+                edge_type_map: HashMap::new(),
+                edge_type_vec: Vec::new(),
+                outgoing: Vec::new(),
+                incoming: Vec::new(),
+                tombstones: BitVec::new(),
+            }
+        }
+
+        /// Compacts internal vectors to minimize memory usage.
+        /// Should be called after bulk hydration.
+        pub fn compact(&mut self) {
+            self.outgoing.shrink_to_fit();
+            self.outgoing.iter_mut().for_each(|v| v.shrink_to_fit());
+            self.incoming.shrink_to_fit();
+            self.incoming.iter_mut().for_each(|v| v.shrink_to_fit());
+            self.edge_type_vec.shrink_to_fit();
+        }
+
+        /// Resolves or creates an internal u32 ID for a node string.
+        /// Resizes internal storage if necessary.
+        pub fn get_or_create_node(&mut self, id: &str) -> u32 {
+            let internal_id = self.node_interner.intern(id);
+            let idx = internal_id as usize;
+
+            // Ensure vectors are large enough to hold this node
+            if idx >= self.outgoing.len() {
+                let new_len = idx + 1;
+                self.outgoing.resize_with(new_len, Vec::new);
+                self.incoming.resize_with(new_len, Vec::new);
+                // Resize tombstones, filling new slots with false (active)
+                self.tombstones.resize(new_len, false);
+            }
+            internal_id
+        }
+
+        /// Marks a node as deleted (soft delete).
+        /// Traversals will skip this node.
+        pub fn remove_node(&mut self, id: &str) {
+            if let Some(u_id) = self.node_interner.lookup_id(id) {
+                let idx = u_id as usize;
+                if idx < self.tombstones.len() {
+                    self.tombstones.set(idx, true);
+                }
+            }
+        }
+
+        /// Returns the total number of edges in the graph.
+        pub fn edge_count(&self) -> usize {
+            self.outgoing.iter().map(|edges| edges.len()).sum()
+        }
+
+        /// Resolves or creates a u8 ID for an edge type string.
+        /// Panics if more than 255 edge types are used (V1 constraint).
+        pub fn get_or_create_type(&mut self, type_name: &str) -> u8 {
+            if let Some(&id) = self.edge_type_map.get(type_name) {
+                return id;
+            }
+            let id = self.edge_type_vec.len();
+            if id > 255 {
+                panic!("QuackGraph V1 Limit: Max 256 unique edge types supported.");
+            }
+            let id_u8 = id as u8;
+            self.edge_type_vec.push(type_name.to_string());
+            self.edge_type_map.insert(type_name.to_string(), id_u8);
+            id_u8
+        }
+
+        /// Adds an edge to the graph. 
+        /// Idempotent: Does not add duplicate edges if they already exist.
+        pub fn add_edge(&mut self, source: &str, target: &str, edge_type: &str) {
+            let u_src = self.get_or_create_node(source);
+            let u_tgt = self.get_or_create_node(target);
+            let u_type = self.get_or_create_type(edge_type);
+
+            // Add to forward index (Idempotent)
+            let out_vec = &mut self.outgoing[u_src as usize];
+            if !out_vec.contains(&(u_tgt, u_type)) {
+                out_vec.push((u_tgt, u_type));
+            }
+            
+            // Add to reverse index (Idempotent)
+            let in_vec = &mut self.incoming[u_tgt as usize];
+            if !in_vec.contains(&(u_src, u_type)) {
+                in_vec.push((u_src, u_type));
+            }
+
+            // Ensure nodes are not tombstoned if they are being re-added/linked
+            if self.tombstones.get(u_src as usize).as_deref() == Some(&true) {
+                self.tombstones.set(u_src as usize, false);
+            }
+            if self.tombstones.get(u_tgt as usize).as_deref() == Some(&true) {
+                self.tombstones.set(u_tgt as usize, false);
+            }
+        }
+
+        /// Removes a specific edge from the graph.
+        /// Uses swap_remove for O(1) removal, order is not preserved.
+        pub fn remove_edge(&mut self, source: &str, target: &str, edge_type: &str) {
+            // We only proceed if all entities exist in our interner/maps
+            if let (Some(u_src), Some(u_tgt), Some(u_type)) = (
+                self.node_interner.lookup_id(source),
+                self.node_interner.lookup_id(target),
+                self.edge_type_map.get(edge_type).copied(),
+            ) {
+                // Remove from outgoing
+                if let Some(edges) = self.outgoing.get_mut(u_src as usize) {
+                    if let Some(pos) = edges.iter().position(|x| *x == (u_tgt, u_type)) {
+                        edges.swap_remove(pos);
+                    }
+                }
+                // Remove from incoming
+                if let Some(edges) = self.incoming.get_mut(u_tgt as usize) {
+                    if let Some(pos) = edges.iter().position(|x| *x == (u_src, u_type)) {
+                        edges.swap_remove(pos);
+                    }
+                }
+            }
+        }
+
+        /// Ingests an Apache Arrow RecordBatch directly.
+        /// Expected Schema: Columns named "source", "target", "type" (case-insensitive or exact).
+        pub fn add_arrow_batch(&mut self, batch: &RecordBatch) -> Result<(), String> {
+            let schema = batch.schema();
+            
+            // Resolve column indices by name for robustness (Case-Insensitive)
+            let find_col = |name: &str| -> Result<usize, String> {
+                schema.fields().iter().position(|f| f.name().eq_ignore_ascii_case(name))
+                    .ok_or_else(|| format!("Column '{}' not found in Arrow Batch. Available: {:?}", name, schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()))
+            };
+            
+            let num_rows = batch.num_rows();
+            if num_rows == 0 {
+                return Ok(());
+            }
+
+            // Helper to ensure we have a String/LargeString array, casting Dictionary if needed
+            let prepare_col = |col: &std::sync::Arc<dyn Array>, name: &str| -> Result<std::sync::Arc<dyn Array>, String> {
+                match col.data_type() {
+                    DataType::Utf8 | DataType::LargeUtf8 => Ok(col.clone()),
+                    DataType::Dictionary(_key_type, value_type) => {
+                        // Check if the dictionary value type is a string type we can handle
+                        match value_type.as_ref() {
+                            DataType::Utf8 | DataType::LargeUtf8 => {
+                                // Cast the dictionary to its underlying value type
+                                cast(col.as_ref(), value_type.as_ref())
+                                    .map_err(|e| format!("Cast error for {} column: {}", name, e))
+                            },
+                            other => {
+                                Err(format!("{} column: Dictionary value type {:?} not supported (expected Utf8/LargeUtf8)", name, other))
+                            }
+                        }
+                    },
+                    dt => Err(format!("{} column: Unsupported type {:?}", name, dt)),
+                }
+            };
+
+            let src_col = prepare_col(batch.column(find_col("source")?), "Source")?;
+            let tgt_col = prepare_col(batch.column(find_col("target")?), "Target")?;
+            let type_col = prepare_col(batch.column(find_col("type")?), "Type")?;
+
+            // Wrapper to handle different string array types (Utf8 vs LargeUtf8)
+            enum StringArrayWrapper<'a> {
+                Small(&'a StringArray),
+                Large(&'a LargeStringArray),
+            }
+
+            impl<'a> StringArrayWrapper<'a> {
+                fn value(&self, i: usize) -> &'a str {
+                    match self {
+                        Self::Small(arr) => arr.value(i),
+                        Self::Large(arr) => arr.value(i),
+                    }
+                }
+            }
+
+            macro_rules! get_wrapper {
+                ($col:expr) => {
+                    match $col.data_type() {
+                        DataType::Utf8 => StringArrayWrapper::Small($col.as_string::<i32>()),
+                        DataType::LargeUtf8 => StringArrayWrapper::Large($col.as_string::<i64>()),
+                        _ => unreachable!("Already validated/casted to Utf8/LargeUtf8"),
+                    }
+                }
+            }
+
+            let src_wrapper = get_wrapper!(src_col);
+            let tgt_wrapper = get_wrapper!(tgt_col);
+            let type_wrapper = get_wrapper!(type_col);
+
+            for i in 0..num_rows {
+                self.add_edge(src_wrapper.value(i), tgt_wrapper.value(i), type_wrapper.value(i));
+            }
+            Ok(())
+        }
+
+        /// Generic traversal step (Bidirectional).
+        /// Given a list of source node IDs (strings), find all neighbors connected by `edge_type`
+        /// in the specified `direction`.
+        pub fn traverse(&self, sources: &[String], edge_type: Option<&str>, direction: Direction) -> Vec<String> {
+            let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
+            
+            let mut result_ids: Vec<u32> = Vec::with_capacity(sources.len() * 2);
+            
+            let adjacency = match direction {
+                Direction::Outgoing => &self.outgoing,
+                Direction::Incoming => &self.incoming,
+            };
+
+            for src_str in sources {
+                // If source node doesn't exist in our index, skip it
+                if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                    // Check if node is deleted
+                    if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                        continue;
+                    }
+
+                    if let Some(edges) = adjacency.get(src_id as usize) {
+                        for &(target, type_id) in edges {
+                            // Apply edge type filter if present
+                            if let Some(req_type) = type_filter {
+                                if req_type != type_id {
+                                    continue;
+                                }
+                            }
+                            // Check if target is deleted
+                            if self.tombstones.get(target as usize).as_deref() == Some(&true) {
+                                continue;
+                            }
+                            result_ids.push(target);
+                        }
+                    }
+                }
+            }
+
+            // Deduplicate results
+            result_ids.sort_unstable();
+            result_ids.dedup();
+
+            // Convert back to strings
+            result_ids
+                .into_iter()
+                .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
+                .collect()
+        }
+
+        /// Recursive traversal (BFS) with depth bounds.
+        /// Returns unique node IDs reachable within [min_depth, max_depth].
+        pub fn traverse_recursive(
+            &self,
+            sources: &[String],
+            edge_type: Option<&str>,
+            direction: Direction,
+            min_depth: usize,
+            max_depth: usize,
+        ) -> Vec<String> {
+            let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
+            
+            // Track visited nodes to prevent cycles (O(1) access)
+            // We assume the interner length is the upper bound of IDs
+            let mut visited = bitvec![u8, Lsb0; 0; self.node_interner.len()];
+            let mut result_ids: Vec<u32> = Vec::new();
+            
+            // Queue stores (node_id, current_depth)
+            let mut queue: VecDeque<(u32, usize)> = VecDeque::new();
+
+            let adjacency = match direction {
+                Direction::Outgoing => &self.outgoing,
+                Direction::Incoming => &self.incoming,
+            };
+
+            // Initialize Queue
+            for src_str in sources {
+                if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                    // Skip soft-deleted nodes
+                    if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                        continue;
+                    }
+                    
+                    // Mark source as visited so we don't loop back to it
+                    if (src_id as usize) < visited.len() {
+                        visited.set(src_id as usize, true);
+                    }
+                    
+                    // If min_depth is 0, include sources in result
+                    if min_depth == 0 {
+                        result_ids.push(src_id);
+                    }
+                    
+                    // Start search
+                    queue.push_back((src_id, 0));
+                }
+            }
+
+            while let Some((curr_id, curr_depth)) = queue.pop_front() {
+                if curr_depth >= max_depth {
+                    continue;
+                }
+                
+                let next_depth = curr_depth + 1;
+
+                if let Some(edges) = adjacency.get(curr_id as usize) {
+                    for &(target, type_id) in edges {
+                        // Apply edge type filter
+                        if let Some(req_type) = type_filter {
+                            if req_type != type_id {
+                                continue;
+                            }
+                        }
+                        
+                        // Check soft delete
+                        if self.tombstones.get(target as usize).as_deref() == Some(&true) {
+                            continue;
+                        }
+                        
+                        // Check visited and bounds
+                        if (target as usize) < visited.len() && !visited[target as usize] {
+                            visited.set(target as usize, true);
+                            
+                            if next_depth >= min_depth {
+                                result_ids.push(target);
+                            }
+                            
+                            // Continue BFS only if we haven't hit max depth
+                            if next_depth < max_depth {
+                                queue.push_back((target, next_depth));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Sort for deterministic output
+            result_ids.sort_unstable();
+
+            result_ids
+                .into_iter()
+                .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
+                .collect()
+        }
+
+        pub fn node_count(&self) -> usize {
+            self.node_interner.len()
+        }
+
+        /// Serializes the entire graph topology to a binary file.
+        pub fn save_to_file(&self, path: &str) -> Result<(), String> {
+            let file = File::create(path).map_err(|e| e.to_string())?;
+            let writer = BufWriter::new(file);
+            bincode::serialize_into(writer, self).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// Deserializes the graph topology from a binary file.
+        pub fn load_from_file(path: &str) -> Result<Self, String> {
+            let file = File::open(path).map_err(|e| e.to_string())?;
+            let reader = BufReader::new(file);
+            bincode::deserialize_from(reader).map_err(|e| e.to_string())
+        }
+    }
+  packages/native/src/lib.rs: |-
+    #![deny(clippy::all)]
+
+    use napi::bindgen_prelude::*;
+    use napi_derive::napi;
+    use quack_core::{GraphIndex, Direction};
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    #[napi]
+    pub struct NativeGraph {
+        inner: GraphIndex,
+    }
+
+    #[napi]
+    impl NativeGraph {
+        #[napi(constructor)]
+        pub fn new() -> Self {
+            Self {
+                inner: GraphIndex::new(),
+            }
+        }
+
+        #[napi]
+        pub fn add_node(&mut self, id: String) {
+            self.inner.get_or_create_node(&id);
+        }
+
+        /// Hydrates the graph from an Arrow IPC stream (Buffer).
+        /// Zero-copy (mostly) data transfer from DuckDB.
+        #[napi]
+        pub fn load_arrow_ipc(&mut self, buffer: Buffer) -> napi::Result<()> {
+            let cursor = Cursor::new(buffer.as_ref());
+            let reader = StreamReader::try_new(cursor, None).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+            for batch in reader {
+                let batch = batch.map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                self.inner.add_arrow_batch(&batch).map_err(napi::Error::from_reason)?;
+            }
+            Ok(())
+        }
+
+        /// Compacts the graph's memory usage.
+        /// Call this after hydration to reclaim unused capacity in the adjacency lists.
+        #[napi]
+        pub fn compact(&mut self) {
+            self.inner.compact();
+        }
+
+        #[napi]
+        pub fn add_edge(&mut self, source: String, target: String, edge_type: String) {
+            self.inner.add_edge(&source, &target, &edge_type);
+        }
+
+        #[napi]
+        pub fn remove_node(&mut self, id: String) {
+            self.inner.remove_node(&id);
+        }
+
+        #[napi]
+        pub fn remove_edge(&mut self, source: String, target: String, edge_type: String) {
+            self.inner.remove_edge(&source, &target, &edge_type);
+        }
+
+        /// Performs a single-hop traversal (bfs-step).
+        /// Returns unique neighbor IDs.
+        #[napi]
+        pub fn traverse(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>) -> Vec<String> {
+            let dir = match direction.as_deref() {
+                Some("in") | Some("IN") => Direction::Incoming,
+                _ => Direction::Outgoing,
+            };
+            self.inner.traverse(&sources, edge_type.as_deref(), dir)
+        }
+
+        /// Performs a recursive traversal (BFS) with depth bounds.
+        /// Returns unique node IDs reachable within [min_depth, max_depth].
+        #[napi]
+        pub fn traverse_recursive(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>, min_depth: Option<u32>, max_depth: Option<u32>) -> Vec<String> {
+            let dir = match direction.as_deref() {
+                Some("in") | Some("IN") => Direction::Incoming,
+                _ => Direction::Outgoing,
+            };
+            
+            let min = min_depth.unwrap_or(1) as usize;
+            let max = max_depth.unwrap_or(1) as usize;
+            
+            self.inner.traverse_recursive(&sources, edge_type.as_deref(), dir, min, max)
+        }
+
+        /// Returns the number of nodes in the interned index.
+        /// Useful for debugging hydration.
+        #[napi(getter)]
+        pub fn node_count(&self) -> u32 {
+            // We cast to u32 because exposing usize to JS can be finicky depending on napi version,
+            // though napi usually handles numbers well. Safe for V1.
+            self.inner.node_count() as u32
+        }
+
+        #[napi(getter)]
+        pub fn edge_count(&self) -> u32 {
+            self.inner.edge_count() as u32
+        }
+
+        #[napi]
+        pub fn save_snapshot(&self, path: String) -> napi::Result<()> {
+            self.inner.save_to_file(&path).map_err(napi::Error::from_reason)
+        }
+
+        #[napi]
+        pub fn load_snapshot(&mut self, path: String) -> napi::Result<()> {
+            let loaded = GraphIndex::load_from_file(&path).map_err(napi::Error::from_reason)?;
+            self.inner = loaded;
+            Ok(())
+        }
+    }
+
+    impl Default for NativeGraph {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+  packages/native/index.d.ts: |
+    /* tslint:disable */
+    /* eslint-disable */
+
+    /* auto-generated by NAPI-RS */
+
+    export declare class NativeGraph {
+      constructor()
+      addNode(id: string): void
+      /**
+       * Hydrates the graph from an Arrow IPC stream (Buffer).
+       * Zero-copy (mostly) data transfer from DuckDB.
+       */
+      loadArrowIpc(buffer: Buffer): void
+      /**
+       * Compacts the graph's memory usage.
+       * Call this after hydration to reclaim unused capacity in the adjacency lists.
+       */
+      compact(): void
+      addEdge(source: string, target: string, edgeType: string): void
+      removeNode(id: string): void
+      removeEdge(source: string, target: string, edgeType: string): void
+      /**
+       * Performs a single-hop traversal (bfs-step).
+       * Returns unique neighbor IDs.
+       */
+      traverse(sources: Array<string>, edgeType?: string | undefined | null, direction?: string | undefined | null): Array<string>
+      /**
+       * Performs a recursive traversal (BFS) with depth bounds.
+       * Returns unique node IDs reachable within [min_depth, max_depth].
+       */
+      traverseRecursive(sources: Array<string>, edgeType?: string | undefined | null, direction?: string | undefined | null, minDepth?: number | undefined | null, maxDepth?: number | undefined | null): Array<string>
+      /**
+       * Returns the number of nodes in the interned index.
+       * Useful for debugging hydration.
+       */
+      get nodeCount(): number
+      get edgeCount(): number
+      saveSnapshot(path: string): void
+      loadSnapshot(path: string): void
+    }
+  packages/quack-graph/src/query.ts: |-
+    import type { QuackGraph } from './graph';
+
+    type TraversalStep = {
+      type: 'out' | 'in' | 'recursive';
+      edge: string;
+      direction?: 'out' | 'in';
+      bounds?: { min: number; max: number };
+    };
+
+    export class QueryBuilder {
+      private graph: QuackGraph;
+      private startLabels: string[];
+      private endLabels: string[] = [];
+
+      // Bottom Bun Filters (Initial selection)
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      private initialFilters: Record<string, any> = {};
+      private vectorSearch: { vector: number[]; limit: number } | null = null;
+
+      // The Meat (Traversal)
+      private traversals: TraversalStep[] = [];
+
+      // Top Bun Filters (Final selection)
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      private terminalFilters: Record<string, any> = {};
+
+      constructor(graph: QuackGraph, labels: string[]) {
+        this.graph = graph;
+        this.startLabels = labels;
+      }
+
+      /**
+       * Traverses the graph recursively (BFS) with depth bounds.
+       * Useful for variable length paths like `(a)-[:KNOWS*1..5]->(b)`.
+       * @param edgeType The edge label to follow.
+       * @param options min/max depth (default: 1..5).
+       * @param direction 'out' (default) or 'in'.
+       */
+      recursive(edgeType: string, options: { min?: number; max?: number } = {}, direction: 'out' | 'in' = 'out'): this {
+        this.traversals.push({
+          type: 'recursive',
+          edge: edgeType,
+          direction,
+          bounds: {
+            min: options.min ?? 1,
+            max: options.max ?? 5,
+          }
+        });
+        return this;
+      }
+
+      /**
+       * Filter nodes by properties.
+       * If called before traversal, applies to Start Nodes.
+       * If called after traversal, applies to End Nodes.
+       */
+      // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
+      where(criteria: Record<string, any>): this {
+        if (this.traversals.length === 0) {
+          this.initialFilters = { ...this.initialFilters, ...criteria };
+        } else {
+          this.terminalFilters = { ...this.terminalFilters, ...criteria };
+        }
+        return this;
+      }
+
+      /**
+       * Perform a Vector Similarity Search (HNSW).
+       * This effectively sorts the start nodes by distance to the query vector.
+       */
+      nearText(vector: number[], options: { limit?: number } = {}): this {
+        this.vectorSearch = { 
+          vector, 
+          limit: options.limit || 10 
+        };
+        return this;
+      }
+
+      out(edgeType: string): this {
+        this.traversals.push({ type: 'out', edge: edgeType });
+        return this;
+      }
+
+      in(edgeType: string): this {
+        this.traversals.push({ type: 'in', edge: edgeType });
+        return this;
+      }
+
+      /**
+       * Filter the nodes at the end of the traversal by label.
+       */
+      node(labels: string[]): this {
+        this.endLabels = labels;
+        return this;
+      }
+
+      /**
+       * Helper to construct the temporal validity clause
+       */
+      private getTemporalClause(tableAlias: string = ''): string {
+        const prefix = tableAlias ? `${tableAlias}.` : '';
+        if (this.graph.context.asOf) {
+          // Time Travel: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+          // Interpolate strict ISO string
+          const iso = this.graph.context.asOf.toISOString();
+          // DuckDB TIMESTAMP comparison works with ISO strings
+          return `(${prefix}valid_from <= '${iso}' AND (${prefix}valid_to > '${iso}' OR ${prefix}valid_to IS NULL))`;
+        }
+        // Default: Current valid records (valid_to is NULL)
+        return `${prefix}valid_to IS NULL`;
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: Generic result mapper
+      async select<T = any>(mapper?: (node: any) => T): Promise<T[]> {
+        // --- Step 1: DuckDB Filter (Bottom Bun) ---
+        // Objective: Get a list of "Active" Node IDs to feed into the graph.
+
+        let query = `SELECT id FROM nodes`;
+        // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+        const params: any[] = [];
+        const conditions: string[] = [];
+
+        // 1.a Temporal Filter
+        conditions.push(this.getTemporalClause());
+
+        // 1.b Label Filter
+        if (this.startLabels.length > 0) {
+          // Check if ANY of the labels match. For V1 we check the first one or intersection.
+          conditions.push(`list_contains(labels, ?)`);
+          params.push(this.startLabels[0]);
+        }
+
+        // 1.c Property Filter
+        for (const [key, value] of Object.entries(this.initialFilters)) {
+          if (key === 'id') {
+            conditions.push(`id = ?`);
+            params.push(value);
+          } else {
+            conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+            params.push(JSON.stringify(value));
+          }
+        }
+
+        // 1.d Vector Search (Order By Distance)
+        let orderBy = '';
+        let limit = '';
+        if (this.vectorSearch) {
+          // Requires: array_distance(embedding, [1,2,3])
+          // DuckDB VSS extension syntax
+          const vectorStr = `[${this.vectorSearch.vector.join(',')}]`; // Inline vector for V1
+          orderBy = `ORDER BY array_distance(embedding, ${vectorStr}::FLOAT[${this.vectorSearch.vector.length}])`;
+          limit = `LIMIT ${this.vectorSearch.limit}`;
+        }
+
+        if (conditions.length > 0) {
+          query += ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        query += ` ${orderBy} ${limit}`;
+
+        const startRows = await this.graph.db.query(query, params);
+        let currentIds: string[] = startRows.map(row => row.id);
+
+        if (currentIds.length === 0) return [];
+
+        // --- Step 2: Rust Traversal (The Meat) ---
+        // Note: Rust Graph Index is currently "Latest Topology Only". 
+        // Time Travel on topology requires checking edge validity during traversal (V2).
+        // For V1, we accept that traversal is instant/current, but properties are historical.
+
+        for (const step of this.traversals) {
+          if (currentIds.length === 0) break;
+          
+          if (step.type === 'recursive') {
+            currentIds = this.graph.native.traverseRecursive(
+              currentIds,
+              step.edge,
+              step.direction || 'out',
+              step.bounds?.min,
+              step.bounds?.max
+            );
+          } else {
+            // step.type is 'out' | 'in'
+            currentIds = this.graph.native.traverse(currentIds, step.edge, step.type as 'out' | 'in');
+          }
+        }
+
+        // Optimization: If traversal resulted in no nodes, stop early.
+        if (currentIds.length === 0) return [];
+
+        // --- Step 3: DuckDB Hydration (Top Bun) ---
+        // Objective: Fetch full properties for the resulting IDs, applying terminal filters.
+
+        const finalConditions: string[] = [];
+        // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
+        const finalParams: any[] = [];
+
+        // 3.0 Label Filter (for End Nodes)
+        if (this.endLabels.length > 0) {
+          finalConditions.push(`list_contains(labels, ?)`);
+          finalParams.push(this.endLabels[0]);
+        }
+
+        // 3.a IDs match
+        // We can't use parameters for IN clause effectively with dynamic length in all drivers.
+        // Constructing placeholders.
+        const placeholders = currentIds.map(() => '?').join(',');
+        finalConditions.push(`id IN (${placeholders})`);
+        finalParams.push(...currentIds);
+
+        // 3.b Temporal Validity
+        finalConditions.push(this.getTemporalClause());
+
+        // 3.c Terminal Property Filters
+        for (const [key, value] of Object.entries(this.terminalFilters)) {
+          if (key === 'id') {
+            finalConditions.push(`id = ?`);
+            finalParams.push(value);
+          } else {
+            finalConditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+            finalParams.push(JSON.stringify(value));
+          }
+        }
+
+        const finalSql = `SELECT * FROM nodes WHERE ${finalConditions.join(' AND ')}`;
+        const results = await this.graph.db.query(finalSql, finalParams);
+
+        return results.map(r => {
+          let props = r.properties;
+          if (typeof props === 'string') {
+            try { props = JSON.parse(props); } catch {}
+          }
+          const node = {
+            id: r.id,
+            labels: r.labels,
+            ...props
+          };
+          return mapper ? mapper(node) : node;
+        });
+      }
+    }
+approved: false
+linesAdded: null
+linesRemoved: null
+linesDifference: null
+gitCommittedAt: null
+status: undone
+id: 46

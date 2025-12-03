@@ -1,0 +1,90 @@
+uuid: 6b3c4d5e-0000-1111-2222-333344445555
+projectId: quackgraph
+createdAt: '2025-12-02T08:16:59.369Z'
+gitCommitMsg: >-
+  chore: add clean, dev, and postinstall scripts
+
+  - `clean`: Removes build artifacts (node_modules, target, .node files). -
+  `postinstall`: Builds the native Rust extension automatically after install. -
+  `dev`: Runs `bun test --watch` for rapid development.
+promptSummary: >-
+  Added `clean`, `postinstall`, and `dev` scripts to `package.json`. `clean`
+  removes artifacts. `postinstall` ensures the Rust native module is built
+  automatically after `bun install`. `dev` runs tests in watch mode.
+reasoning:
+  - I will add the requested lifecycle scripts to `package.json`.
+  - >-
+    1.  **`clean`**: Removes `node_modules`, Cargo's `target` directory, and the
+    compiled `.node` bindings.
+  - >-
+    2.  **`postinstall`**: Automatically runs the Rust build after `bun install`
+    completes. This satisfies the "install along with rust" requirement,
+    ensuring the native extension is ready immediately.
+  - >-
+    3.  **`dev`**: runs the test suite in watch mode, which is the standard
+    "development server" equivalent for library development.
+operations:
+  - type: write
+    path: package.json
+    content: >
+      --- package.json
+
+      +++ package.json
+
+      @@ -7,6 +7,8 @@
+           "packages/*"
+         ],
+         "scripts": {
+      +    "clean": "rm -rf node_modules target packages/*/node_modules
+      packages/*/dist packages/native/*.node",
+
+      +    "postinstall": "bun run --cwd packages/native build",
+           "format": "biome format --write . && cargo fmt",
+           "typecheck": "tsc --noEmit && cargo check --workspace",
+           "lint": "biome lint . && cargo clippy --workspace -- -D warnings",
+      -    "test": "bun test && cargo test --workspace",
+
+      -    "build": "bun run --cwd packages/native build && tsc"
+
+      +    "dev": "bun test --watch",
+
+      +    "test": "bun test && cargo test --workspace",
+
+      +    "build": "bun run --cwd packages/native build && tsc"
+         },
+         "devDependencies": {
+    patchStrategy: standard-diff
+snapshot:
+  package.json: |
+    {
+      "name": "quackgraph",
+      "module": "index.ts",
+      "type": "module",
+      "private": true,
+      "workspaces": [
+        "packages/*"
+      ],
+      "scripts": {
+        "format": "biome format --write . && cargo fmt",
+        "typecheck": "tsc --noEmit && cargo check --workspace",
+        "lint": "biome lint . && cargo clippy --workspace -- -D warnings",
+        "check": "biome check . && bun run typecheck",
+        "test": "bun test && cargo test --workspace",
+        "build": "bun run --cwd packages/native build && tsc"
+      },
+      "devDependencies": {
+        "@biomejs/biome": "latest",
+        "@types/bun": "latest",
+        "typescript": "^5.0.0"
+      },
+      "peerDependencies": {
+        "typescript": "^5"
+      }
+    }
+approved: true
+linesAdded: 3
+linesRemoved: 0
+linesDifference: 3
+gitCommittedAt: '2025-12-02T08:17:06.623Z'
+status: committed
+id: 7
