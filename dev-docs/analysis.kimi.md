@@ -43,6 +43,8 @@ DONE
 
 
 
+DONE
+
 ### 4. **Vector Search Fallback is Broken**
 ```sql
 POW(COALESCE(embedding[0], 0) - 0.1, 2) + ... -- Full table scan!
@@ -88,7 +90,7 @@ if (!ALLOWED_TYPES.includes(type.toUpperCase())) throw ...;
 | Full table scans | `SchemaManager` | High | Add indexes (see above) |
 | Unnecessary clones | `Interner::intern()` | Low | `key.clone()` is fine; no issue |
 
----
+--- DOING
 
 ## 🎯 API Design Issues
 

@@ -61,4 +61,20 @@ describe('Integration: Error Handling & Edge Cases', () => {
     
     expect(reverse).toEqual([crazyId]);
   });
+
+  test('should throw error when nearText is used without VSS extension', async () => {
+    const setup = await createGraph('disk', 'error-vss');
+    g = setup.graph;
+    path = setup.path;
+
+    // Force disable VSS capability
+    g.capabilities.vss = false;
+
+    // Attempt vector search
+    const promise = g.match(['Node'])
+      .nearText([1, 2, 3])
+      .select();
+
+    await expect(promise).rejects.toThrow('Vector search requires the DuckDB "vss" extension');
+  });
 });

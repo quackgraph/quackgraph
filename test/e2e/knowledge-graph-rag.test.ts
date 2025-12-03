@@ -19,7 +19,8 @@ describe('E2E: Knowledge Graph RAG (Vector + Graph)', () => {
     // This ensures tests pass on environments without the VSS binary extension
     if (!g.capabilities.vss) {
        try {
-         await g.db.query("SELECT array_distance([1,2], [3,4])");
+         // Verify array_distance availability before claiming VSS support
+         await g.db.query("SELECT array_distance([1,2]::DOUBLE[], [3,4]::DOUBLE[])");
          g.capabilities.vss = true;
        } catch (_e) {
          console.warn("Skipping RAG test: array_distance not supported in this DuckDB build.");

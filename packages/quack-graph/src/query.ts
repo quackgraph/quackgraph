@@ -1,9 +1,8 @@
 import type { QuackGraph } from './graph';
 
 type TraversalStep = {
-  type: 'out' | 'in' | 'recursive';
+  type: 'out' | 'in';
   edge: string;
-  direction?: 'out' | 'in';
   bounds?: { min: number; max: number };
 };
 
@@ -37,22 +36,18 @@ export class QueryBuilder {
   }
 
   /**
-   * Traverses the graph recursively (BFS) with depth bounds.
+   * Sets depth bounds for the last traversal step.
    * Useful for variable length paths like `(a)-[:KNOWS*1..5]->(b)`.
-   * @param edgeType The edge label to follow.
-   * @param options min/max depth (default: 1..5).
-   * @param direction 'out' (default) or 'in'.
+   * Must be called immediately after .out() or .in().
+   * @param min Minimum hops (default: 1)
+   * @param max Maximum hops (default: 1)
    */
-  recursive(edgeType: string, options: { min?: number; max?: number } = {}, direction: 'out' | 'in' = 'out'): this {
-    this.traversals.push({
-      type: 'recursive',
-      edge: edgeType,
-      direction,
-      bounds: {
-        min: options.min ?? 1,
-        max: options.max ?? 5,
-      }
-    });
+  depth(min: number, max: number): this {
+    if (this.traversals.length === 0) {
+      throw new Error("depth() must be called after a traversal step (.out() or .in())");
+    }
+    const lastStep = this.traversals[this.traversals.length - 1];
+    lastStep.bounds = { min, max };
     return this;
   }
 
@@ -179,16 +174,12 @@ export class QueryBuilder {
     let orderBy = '';
     let limit = '';
     if (this.vectorSearch) {
-      // Requires: array_distance(embedding, [1,2,3])
-      // DuckDB VSS extension syntax
-      // Fallback: Use basic array operations since VSS extension has type compatibility issues
-      // This implements a simple Euclidean distance calculation
-      const vectorValues = this.vectorSearch.vector.map((v, i) => {
-        const embeddingElement = `embedding[${i}]`;
-        return `POW(COALESCE(${embeddingElement}, 0) - ${v}, 2)`;
-      }).join(' + ');
-      orderBy = `ORDER BY SQRT(${vectorValues})`;
+      if (!this.graph.capabilities.vss) {
+        throw new Error('Vector search requires the DuckDB "vss" extension, which is not available or failed to load.');
+      }
+      orderBy = `ORDER BY array_distance(embedding, ?::DOUBLE[])`;
       limit = `LIMIT ${this.vectorSearch.limit}`;
+      params.push(JSON.stringify(this.vectorSearch.vector));
     }
 
     if (conditions.length > 0) {
@@ -212,18 +203,18 @@ export class QueryBuilder {
 
       if (currentIds.length === 0) break;
       
-      if (step.type === 'recursive') {
+      if (step.bounds) {
         currentIds = this.graph.native.traverseRecursive(
           currentIds,
           step.edge,
-          step.direction || 'out',
-          step.bounds?.min,
-          step.bounds?.max,
+          step.type,
+          step.bounds.min,
+          step.bounds.max,
           asOfTs
         );
       } else {
         // step.type is 'out' | 'in'
-        currentIds = this.graph.native.traverse(currentIds, step.edge, step.type as 'out' | 'in', asOfTs);
+        currentIds = this.graph.native.traverse(currentIds, step.edge, step.type, asOfTs);
       }
     }
 

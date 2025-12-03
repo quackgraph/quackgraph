@@ -135,7 +135,7 @@ const results = await g
 
   // 2. Traversal: Rust In-Memory CSR (Nanoseconds)
   // Find everything this material flows into, up to 10 hops deep
-  .recursive('PART_OF', { min: 1, max: 10 })
+  .out('PART_OF').depth(1, 10)
 
   // 3. Filter: Apply logic to the found nodes
   .node(['Product'])
@@ -204,7 +204,7 @@ Match Neo4j's expressiveness with fluent ergonomics.
 // Find friends of friends (1 to 5 hops away)
 const network = await g.match(['User'])
   .where({ id: 'Alice' })
-  .recursive('KNOWS', { min: 1, max: 5 })
+  .out('KNOWS').depth(1, 5)
   .select(u => u.name);
 ```
 
@@ -231,6 +231,22 @@ const userId = await g.mergeNode('User', { email: 'alice@corp.com' })
   .match({ email: 'alice@corp.com' })   // Look up by unique key
   .set({ last_seen: new Date() })       // Update if exists
   .run();
+```
+
+### 6. Batch Ingestion
+For high-throughput scenarios, use batch operations to minimize transaction overhead.
+
+```typescript
+// Insert 10,000 nodes in one transaction
+await g.addNodes([
+  { id: 'u:1', labels: ['User'], properties: { name: 'Alice' } },
+  { id: 'u:2', labels: ['User'], properties: { name: 'Bob' } }
+]);
+
+// Insert 50,000 edges
+await g.addEdges([
+  { source: 'u:1', target: 'u:2', type: 'KNOWS', properties: { since: 2022 } }
+]);
 ```
 
 ---

@@ -30,6 +30,13 @@ export class SchemaManager {
   async ensureSchema() {
     await this.db.execute(NODES_TABLE);
     await this.db.execute(EDGES_TABLE);
+
+    // Performance Indexes
+    // Note: Partial indexes (WHERE valid_to IS NULL) are not supported in all DuckDB environments/bindings yet.
+    // We use standard indexes for now.
+    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_nodes_id ON nodes (id)');
+    // idx_nodes_labels removed: Standard B-Tree on LIST column does not help list_contains() queries.
+    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_edges_src_tgt_type ON edges (source, target, type)');
   }
 
   // biome-ignore lint/suspicious/noExplicitAny: generic properties

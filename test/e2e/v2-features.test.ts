@@ -31,7 +31,7 @@ describe('E2E: V2 Features (Recursion & Merge)', () => {
     // Should find B (1 hop) and C (2 hops)
     const result1 = await g.match(['Node'])
       .where({ id: 'A' })
-      .recursive('NEXT', { min: 1, max: 2 })
+      .out('NEXT').depth(1, 2)
       .select(n => n.id);
     
     expect(result1.sort()).toEqual(['B', 'C']);
@@ -40,7 +40,7 @@ describe('E2E: V2 Features (Recursion & Merge)', () => {
     // Should find C (2), D (3), E (4)
     const result2 = await g.match(['Node'])
       .where({ id: 'A' })
-      .recursive('NEXT', { min: 2, max: 4 })
+      .out('NEXT').depth(2, 4)
       .select(n => n.id);
     
     expect(result2.sort()).toEqual(['C', 'D', 'E']);
@@ -48,7 +48,7 @@ describe('E2E: V2 Features (Recursion & Merge)', () => {
     // Query 3: Max depth exceeding chain
     const result3 = await g.match(['Node'])
       .where({ id: 'A' })
-      .recursive('NEXT', { min: 1, max: 10 })
+      .out('NEXT').depth(1, 10)
       .select(n => n.id);
     
     expect(result3.sort()).toEqual(['B', 'C', 'D', 'E']);
@@ -69,7 +69,7 @@ describe('E2E: V2 Features (Recursion & Merge)', () => {
     // Rust implementation marks start node as visited, so it shouldn't be returned unless it's encountered again via a longer path (but BFS with visited set prevents re-visiting).
     const res = await g.match(['Node'])
       .where({ id: 'A' })
-      .recursive('LOOP', { min: 1, max: 5 })
+      .out('LOOP').depth(1, 5)
       .select(n => n.id);
       
     // A -> B (visited=A,B) -> A (skip)
@@ -109,5 +109,13 @@ describe('E2E: V2 Features (Recursion & Merge)', () => {
     const node2 = await g.match(['User']).where({ email: 'test@example.com' }).select();
     expect(node2[0].loginCount).toBe(2);
     expect(node2[0].name).toBe('Test User'); // Should persist
+  });
+
+  test('should throw error when depth is used without traversal', async () => {
+    const setup = await createGraph('memory');
+    g = setup.graph;
+
+    const query = () => g.match(['Node']).depth(1, 2);
+    expect(query).toThrow('depth() must be called after a traversal step');
   });
 });
