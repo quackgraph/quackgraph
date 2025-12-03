@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach } from 'bun:test';
 import { createGraph, cleanupGraph, sleep } from '../utils/helpers';
-import type { QuackGraph } from '../../packages/quack-graph/src/index';
+import { QuackGraph } from '../../packages/quack-graph/src/index';
 
 describe('Integration: Temporal Time-Travel', () => {
   let g: QuackGraph;

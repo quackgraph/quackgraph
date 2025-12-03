@@ -54,9 +54,14 @@ describe('Integration: Persistence & Hydration', () => {
 
     // Soft Delete
     await g1.deleteEdge('a', 'b', 'KNOWS');
-    
+
     // Verify immediate effect in Memory
     expect(g1.native.traverse(['a'], 'KNOWS', 'out')).toEqual([]);
+
+    // Check DB persistence explicitly
+    const dbRows = await g1.db.query("SELECT valid_to FROM edges WHERE source='a' AND target='b' AND type='KNOWS'");
+    expect(dbRows.length).toBe(1);
+    expect(dbRows[0].valid_to).not.toBeNull();
 
     // Restart / Hydrate
     const g2 = new QuackGraph(setup.path);

@@ -1,0 +1,321 @@
+uuid: 4a2b8c3d-9e1f-4567-a890-1234567890ab
+projectId: quackgraph
+createdAt: '2025-12-03T02:06:51.414Z'
+gitCommitMsg: >-
+  test: fix QuackGraph import in temporal tests and add db assertions to
+  persistence test
+promptSummary: >-
+  Fix ReferenceError in temporal tests and add debugging assertions for
+  persistence test failure.
+reasoning:
+  - >-
+    To address the test failures, I'm fixing the `ReferenceError` in
+    `temporal.test.ts` and adding explicit database state verification to
+    `persistence.test.ts` to debug the hydration issue.
+  - >-
+    1.  **Fix `temporal.test.ts`**: Change the import of `QuackGraph` from a
+    type import to a value import, as it's instantiated via `new`.
+  - >-
+    2.  **Debug `persistence.test.ts`**: Add an assertion to verify that the
+    `deleteEdge` operation successfully updated the `valid_to` column in DuckDB
+    before hydration occurs. This will isolate whether the issue is with the
+    database transaction or the hydration logic.
+operations:
+  - type: write
+    path: test/integration/temporal.test.ts
+    content: |
+      <<<<<<< SEARCH
+      import { createGraph, cleanupGraph, sleep } from '../utils/helpers';
+      import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('Integration: Temporal Time-Travel', () => {
+      =======
+      import { createGraph, cleanupGraph, sleep } from '../utils/helpers';
+      import { QuackGraph } from '../../packages/quack-graph/src/index';
+
+      describe('Integration: Temporal Time-Travel', () => {
+      >>>>>>> REPLACE
+    patchStrategy: search-replace
+  - type: write
+    path: test/integration/persistence.test.ts
+    content: |
+      <<<<<<< SEARCH
+          // Soft Delete
+          await g1.deleteEdge('a', 'b', 'KNOWS');
+          
+          // Verify immediate effect in Memory
+          expect(g1.native.traverse(['a'], 'KNOWS', 'out')).toEqual([]);
+
+          // Restart / Hydrate
+          const g2 = new QuackGraph(setup.path);
+      =======
+          // Soft Delete
+          await g1.deleteEdge('a', 'b', 'KNOWS');
+          
+          // Verify immediate effect in Memory
+          expect(g1.native.traverse(['a'], 'KNOWS', 'out')).toEqual([]);
+
+          // Check DB persistence explicitly
+          const dbRows = await g1.db.query("SELECT valid_to FROM edges WHERE source='a' AND target='b' AND type='KNOWS'");
+          expect(dbRows.length).toBe(1);
+          expect(dbRows[0].valid_to).not.toBeNull();
+
+          // Restart / Hydrate
+          const g2 = new QuackGraph(setup.path);
+      >>>>>>> REPLACE
+    patchStrategy: search-replace
+snapshot:
+  test/integration/temporal.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph, sleep } from '../utils/helpers';
+    import type { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('Integration: Temporal Time-Travel', () => {
+      let g: QuackGraph;
+      let path: string;
+
+      afterEach(async () => {
+        if (path) await cleanupGraph(path);
+      });
+
+      test('should retrieve historical property values using asOf', async () => {
+        const setup = await createGraph('disk', 'temporal-props');
+        g = setup.graph;
+        path = setup.path;
+
+        // T0: Create
+        await g.addNode('u1', ['User'], { status: 'active' });
+        const t0 = new Date();
+        await sleep(100); // Ensure clock tick
+
+        // T1: Update
+        await g.addNode('u1', ['User'], { status: 'suspended' });
+        const t1 = new Date();
+        await sleep(100);
+
+        // T2: Update again
+        await g.addNode('u1', ['User'], { status: 'banned' });
+        const _t2 = new Date();
+
+        // Query Current (T2)
+        const current = await g.match(['User']).where({}).select();
+        expect(current[0].status).toBe('banned');
+
+        // Query T0 (Should see 'active')
+        // Note: strict equality might be tricky with microsecond precision,
+        // so we pass a time slightly after T0 or exactly T0.
+        // The query logic is: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
+        // At T0: valid_from=T0, valid_to=T1.
+        // Query at T0: T0 <= T0 (True) AND T1 > T0 (True).
+        const q0 = await g.asOf(t0).match(['User']).where({}).select();
+        expect(q0[0].status).toBe('active');
+
+        // Query T1 (Should see 'suspended')
+        const q1 = await g.asOf(t1).match(['User']).where({}).select();
+        expect(q1[0].status).toBe('suspended');
+      });
+
+      test('should handle node lifecycle (create -> delete)', async () => {
+        const setup = await createGraph('disk', 'temporal-lifecycle');
+        g = setup.graph;
+        path = setup.path;
+
+        // T0: Empty
+        const t0 = new Date();
+        await sleep(50);
+
+        // T1: Alive
+        await g.addNode('temp', ['Temp']);
+        const t1 = new Date();
+        await sleep(50);
+
+        // T2: Deleted
+        await g.deleteNode('temp');
+        const t2 = new Date();
+
+        // Verify
+        const resT0 = await g.asOf(t0).match(['Temp']).select();
+        expect(resT0.length).toBe(0);
+
+        const resT1 = await g.asOf(t1).match(['Temp']).select();
+        expect(resT1.length).toBe(1);
+        expect(resT1[0].id).toBe('temp');
+
+        const resT2 = await g.asOf(t2).match(['Temp']).select();
+        expect(resT2.length).toBe(0);
+      });
+
+      test('should traverse historical topology (Structural Time-Travel)', async () => {
+        // Scenario:
+        // T0: A -> B
+        // T1: Delete A -> B
+        // T2: Create A -> C
+        // Query at T0: Returns B
+        // Query at T2: Returns C
+
+        const setup = await createGraph('disk', 'temporal-topology');
+        g = setup.graph;
+        path = setup.path;
+
+        await g.addNode('A', ['Node']);
+        await g.addNode('B', ['Node']);
+        await g.addNode('C', ['Node']);
+
+        // T0: Create Edge
+        await g.addEdge('A', 'B', 'LINK');
+        await sleep(50);
+        const t0 = new Date();
+        await sleep(50);
+
+        // T1: Delete Edge
+        await g.deleteEdge('A', 'B', 'LINK');
+        await sleep(50);
+
+        // T2: Create New Edge
+        await g.addEdge('A', 'C', 'LINK');
+        await sleep(50);
+        const t2 = new Date();
+
+        // To test historical topology, we must re-hydrate from disk to ensure we have the
+        // complete temporal edge data, as the live instance's memory might have been
+        // modified by hard-deletes (removeEdge).
+        const g2 = new QuackGraph(path);
+        await g2.init();
+
+        // Check T0 (Historical)
+        const resT0 = await g2.asOf(t0).match(['Node']).where({ id: 'A' }).out('LINK').select(n => n.id);
+        expect(resT0).toEqual(['B']);
+
+        // Check T2 (Current)
+        const resT2 = await g2.asOf(t2).match(['Node']).where({ id: 'A' }).out('LINK').select(n => n.id);
+        expect(resT2).toEqual(['C']);
+      });
+    });
+  test/integration/persistence.test.ts: |-
+    import { describe, test, expect, afterEach } from 'bun:test';
+    import { createGraph, cleanupGraph } from '../utils/helpers';
+    import { QuackGraph } from '../../packages/quack-graph/src/index';
+
+    describe('Integration: Persistence & Hydration', () => {
+      // Keep track of paths to clean up
+      const paths: string[] = [];
+
+      afterEach(async () => {
+        for (const p of paths) {
+          await cleanupGraph(p);
+        }
+        paths.length = 0; // Clear
+      });
+
+      test('should hydrate Rust topology from Disk on startup', async () => {
+        // 1. Setup Graph A (Disk)
+        const setup = await createGraph('disk', 'persist-hydrate');
+        const g1 = setup.graph;
+        const path = setup.path;
+        paths.push(path);
+
+        // 2. Add Data to Graph A
+        await g1.addNode('root', ['Root']);
+        await g1.addNode('child1', ['Leaf']);
+        await g1.addNode('child2', ['Leaf']);
+        await g1.addEdge('root', 'child1', 'PARENT_OF');
+        await g1.addEdge('root', 'child2', 'PARENT_OF');
+
+        expect(g1.native.nodeCount).toBe(3);
+        expect(g1.native.edgeCount).toBe(2);
+
+        // 3. Initialize Graph B on the same file (Simulates Restart)
+        const g2 = new QuackGraph(path);
+        await g2.init(); // Triggers hydrate() from Arrow IPC
+
+        // 4. Verify Graph B State
+        expect(g2.native.nodeCount).toBe(3);
+        expect(g2.native.edgeCount).toBe(2);
+
+        const children = g2.native.traverse(['root'], 'PARENT_OF', 'out');
+        expect(children.length).toBe(2);
+        expect(children.sort()).toEqual(['child1', 'child2']);
+      });
+
+      test('should respect soft deletes during hydration', async () => {
+        const setup = await createGraph('disk', 'persist-soft-del');
+        const g1 = setup.graph;
+        paths.push(setup.path);
+
+        await g1.addNode('a', ['A']);
+        await g1.addNode('b', ['B']);
+        await g1.addEdge('a', 'b', 'KNOWS');
+
+        // Soft Delete
+        await g1.deleteEdge('a', 'b', 'KNOWS');
+        
+        // Verify immediate effect in Memory
+        expect(g1.native.traverse(['a'], 'KNOWS', 'out')).toEqual([]);
+
+        // Restart / Hydrate
+        const g2 = new QuackGraph(setup.path);
+        await g2.init();
+
+        // Verify Deleted Edge is NOT hydrated
+        // The edge is loaded into the temporal index, but should not be active.
+        // The raw edge count will include historical edges.
+        expect(g2.native.edgeCount).toBe(1);
+        const neighbors = g2.native.traverse(['a'], 'KNOWS', 'out');
+        expect(neighbors).toEqual([]);
+      });
+
+      test('Snapshot: should save and load binary topology', async () => {
+        const setup = await createGraph('disk', 'persist-snapshot');
+        const g1 = setup.graph;
+        paths.push(setup.path);
+        const snapshotPath = `${setup.path}.bin`;
+        paths.push(snapshotPath); // Cleanup this too
+
+        // Populate
+        await g1.addNode('x', ['X']);
+        await g1.addNode('y', ['Y']);
+        await g1.addEdge('x', 'y', 'LINK');
+
+        // Save Snapshot
+        g1.optimize.saveTopologySnapshot(snapshotPath);
+
+        // Load New Graph using Snapshot (skipping DB hydration)
+        const g2 = new QuackGraph(setup.path, { topologySnapshot: snapshotPath });
+        await g2.init();
+
+        expect(g2.native.nodeCount).toBe(2);
+        expect(g2.native.edgeCount).toBe(1);
+        expect(g2.native.traverse(['x'], 'LINK', 'out')).toEqual(['y']);
+      });
+
+      test('Special Characters: should handle emojis and spaces in IDs', async () => {
+        const setup = await createGraph('disk', 'persist-special');
+        const g1 = setup.graph;
+        paths.push(setup.path);
+
+        const id1 = 'User A (Admin)';
+        const id2 = 'User B 🦆';
+
+        await g1.addNode(id1, ['User']);
+        await g1.addNode(id2, ['User']);
+        await g1.addEdge(id1, id2, 'EMOJI_LINK 🔗');
+
+        // Restart
+        const g2 = new QuackGraph(setup.path);
+        await g2.init();
+
+        const result = g2.native.traverse([id1], 'EMOJI_LINK 🔗', 'out');
+        expect(result).toEqual([id2]);
+        
+        // Reverse
+        const reverse = g2.native.traverse([id2], 'EMOJI_LINK 🔗', 'in');
+        expect(reverse).toEqual([id1]);
+      });
+    });
+approved: true
+linesAdded: 7
+linesRemoved: 2
+linesDifference: 9
+gitCommittedAt: null
+status: committed
+id: 59

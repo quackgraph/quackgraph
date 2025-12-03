@@ -90,12 +90,12 @@ export class QuackGraph {
   async hydrate() {
     // Zero-Copy Arrow IPC
     // We load ALL edges (active and historical) to support time-travel.
-    // We cast valid_from/valid_to to BIGINT (INT64) to ensure Arrow compatibility
+    // We cast valid_from/valid_to to DOUBLE to ensure JS/JSON compatibility (avoiding BigInt issues in fallback)
     try {
       const ipcBuffer = await this.db.queryArrow(
         `SELECT source, target, type, 
-                date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_from) as valid_from, 
-                date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_to) as valid_to 
+                date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_from)::DOUBLE as valid_from, 
+                date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_to)::DOUBLE as valid_to 
          FROM edges`
       );
     
